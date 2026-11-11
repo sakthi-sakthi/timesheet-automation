@@ -1,3 +1,4 @@
+
 name: Daily Timesheet Automation
 
 on:
@@ -6,6 +7,7 @@ on:
 jobs:
   timesheet:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -18,8 +20,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright
-          playwright install chromium
+          pip install playwright python-dotenv
+          playwright install --with-deps chromium
 
       - name: Run Timesheet
-        run: python timesheet.py
+        env:
+          TS_USER: ${{ secrets.TS_USER }}
+          TS_PASS: ${{ secrets.TS_PASS }}
+          TS_DISPLAY_NAME: ${{ secrets.TS_DISPLAY_NAME }}
+          TASK_SOURCE_URL: ${{ secrets.TASK_SOURCE_URL }}
+        run: python timesheet.py hide
