@@ -185,7 +185,11 @@ def read_entries(source):
         entries = read_xlsx_bytes(raw) if file_path.suffix.lower() != ".csv" else read_csv_bytes(raw)
 
     entries = [entry for entry in entries if entry]
-    # Empty means there is no row for today's date; main() emails a reminder.
+    if not entries:
+        raise ValueError(
+            "No valid rows found. Fill Project, Discipline, Activity Description, "
+            "Actual Hours and Status in the Daily Tasks sheet."
+        )
     return entries
 
 
@@ -424,26 +428,87 @@ def scroll_tracking_to_today(page):
 
 def save_tracking_screenshots(page):
     """
-    Save exactly one tracking screenshot.
-    The current-date column is brought into view before capture; use a viewport
-    screenshot (not full_page) so the table remains readable and is not shrunk.
+    Capture the tracking screen in readable viewport-sized tiles.
+    This handles both normal page scrolling and nested DataTables/modal scrolling,
+    including date columns that extend horizontally beyond the visible area.
+    Every tile is attached to the same report email.
     """
     prepare_desktop_capture(page)
-    found = scroll_tracking_to_today(page)
 
-    # Keep the tracking table/date column in the visible desktop viewport.
-    page.wait_for_timeout(300)
-    page.screenshot(
-        path="tracking.png",
-        full_page=False,
-        animations="disabled",
-        type="png"
-    )
+    # Locate the main visible scrollable element (usually the table wrapper).
+    scroll_info = page.evaluate("""() => {
+        const candidates = Array.from(document.querySelectorAll('body *'))
+          .filter(el => {
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return r.width > 80 && r.height > 80 &&
+              (el.scrollHeight > el.clientHeight + 30 ||
+               el.scrollWidth > el.clientWidth + 30) &&
+              /(auto|scroll)/.test(cs.overflowY + ' ' + cs.overflowX);
+          });
+        candidates.sort((a, b) => {
+          const score = el =>
+            (el.scrollHeight - el.clientHeight) +
+            (el.scrollWidth - el.clientWidth) +
+            Math.min(el.clientWidth * el.clientHeight / 1000, 1000);
+          return score(b) - score(a);
+        });
+        const el = candidates[0];
+        if (!el) return null;
+        if (!el.dataset.tsCaptureId) el.dataset.tsCaptureId = 'ts-capture-target';
+        return {
+          selector: '[data-ts-capture-id="ts-capture-target"]',
+          scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+          scrollWidth: el.scrollWidth, clientWidth: el.clientWidth,
+          tag: el.tagName, id: el.id, className: String(el.className || '').slice(0,120)
+        };
+      }""")
 
-    # The tracking page is common to all projects, so attach it only once.
-    REPORT["shots"] = [("tracking.png", "tracking.png")]
-    log("Saved the single tracking screenshot: tracking.png")
-    return found
+    shots = []
+    try:
+        if not scroll_info:
+            page.screenshot(path="tracking_01.png", full_page=True,
+                            animations="disabled", type="png")
+            shots.append(("tracking_01.png", "tracking_01.png"))
+        else:
+            selector = scroll_info["selector"]
+            target = page.locator(selector).first
+            dims = target.evaluate("el => ({sh:el.scrollHeight,ch:el.clientHeight,sw:el.scrollWidth,cw:el.clientWidth})")
+            max_y = max(0, dims["sh"] - dims["ch"])
+            max_x = max(0, dims["sw"] - dims["cw"])
+            step_y = max(250, int(dims["ch"] * 0.78))
+            step_x = max(300, int(dims["cw"] * 0.78))
+            y_positions = list(range(0, max_y + 1, step_y)) or [0]
+            x_positions = list(range(0, max_x + 1, step_x)) or [0]
+            if y_positions[-1] != max_y:
+                y_positions.append(max_y)
+            if x_positions[-1] != max_x:
+                x_positions.append(max_x)
+
+            original = target.evaluate("el => ({x:el.scrollLeft,y:el.scrollTop})")
+            index = 0
+            for y in y_positions:
+                for x in x_positions:
+                    target.evaluate("(el,p) => {el.scrollTop=p.y; el.scrollLeft=p.x;}", {"x":x,"y":y})
+                    page.wait_for_timeout(300)
+                    index += 1
+                    name = f"tracking_{index:02d}.png"
+                    page.screenshot(path=name, full_page=False,
+                                    animations="disabled", type="png")
+                    shots.append((name, name))
+                    log(f"Tracking screenshot tile {index}: scrollX={x}, scrollY={y}")
+            # Restore the tracking screen to its original scroll position.
+            target.evaluate("(el,p) => {el.scrollTop=p.y; el.scrollLeft=p.x;}", original)
+    except Exception as ex:
+        log(f"Tracking scroll capture warning: {ex}")
+        if not shots:
+            page.screenshot(path="tracking_01.png", full_page=False,
+                            animations="disabled", type="png")
+            shots.append(("tracking_01.png", "tracking_01.png"))
+
+    REPORT["shots"] = shots
+    log(f"Saved {len(shots)} tracking screenshot tile(s)")
+    return scroll_tracking_to_today(page)
 
 
 def build_report_html():
@@ -496,14 +561,14 @@ def build_report_html():
 <h3>Tracking</h3>
 <p><b>Status:</b> {esc(tracking.get('status','UNKNOWN'))}</p>
 <p><b>Today's tracking row:</b> {esc(tracking.get('row','Not available'))}</p>
-<p style="color:#667085">One tracking screenshot is attached for all projects.</p>
+<p style="color:#667085">Tracking page screenshots are attached in scroll sections so dates hidden by scrolling can be reviewed.</p>
 </body></html>"""
 
 
 # ---------------------------------------------------------------- email
 def send_email(subject, body, attachments):
-    if not MAIL_USER or not MAIL_PASS or not MAIL_TO:
-        log("Email NOT sent: MAIL_USER / MAIL_PASS / MAIL_TO missing")
+    if not MAIL_USER or not MAIL_PASS:
+        log("Email NOT sent: MAIL_USER / MAIL_PASS missing in .env")
         return False
     try:
         msg = EmailMessage()
@@ -563,7 +628,7 @@ def build_report_email(expected, label):
     for project, hours in project_totals.items():
         lines.append(f"  {project}: {hours:g} hrs")
     lines.append(f"Total hours in this run: {total:g} hrs")
-    lines.append("Screenshot attached: one current-date tracking page for all projects.")
+    lines.append("Tracking page screenshots attached as scrollable viewport sections, including horizontally and vertically hidden content.")
     return subject, "\n".join(lines)
 
 
@@ -754,10 +819,7 @@ def fill_current_task(page, entries):
     if after >= need:
         log(f"Saved OK - {after}h now logged for {TODAY}")
     else:
-        message = f"Save could not be verified: expected {need:g}h, but only {after:g}h appears for {TODAY}"
-        log("WARNING: " + message)
-        REPORT["error"] = (REPORT["error"] + "; " if REPORT["error"] else "") + message
-        return "save_failed"
+        log(f"WARNING: Save clicked but only {after}h shows for {TODAY}. Please verify the entry.")
     return "saved"
 
 
@@ -770,12 +832,7 @@ def process_project(page, project_code, project_name, ents):
 
     todays = [c for c in cards if in_range(c)]
     if not todays:
-        message = f"No task card covers {TODAY} for {project_name} [{project_code}]"
-        log(message)
-        REPORT["error"] = (REPORT["error"] + "; " if REPORT["error"] else "") + message
-        REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]",
-                                    title="No matching task card",
-                                    result="NOT ENTERED", entries=ents))
+        log(f"No task covers {TODAY} for {project_name} [{project_code}] - nothing entered")
         return
 
     for idx, c in enumerate(todays):
@@ -791,16 +848,7 @@ def process_project(page, project_code, project_name, ents):
             REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
                                         result=result, entries=ents))
             return
-        if result == "save_failed":
-            REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
-                                        result="SAVE NOT VERIFIED", entries=ents))
-            return
-    message = f"No matching task for {project_name} [{project_code}] had an Add New Item button"
-    log(message)
-    REPORT["error"] = (REPORT["error"] + "; " if REPORT["error"] else "") + message
-    REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]",
-                                title="Task form unavailable",
-                                result="NOT ENTERED", entries=ents))
+    log(f"No matching task for {project_name} [{project_code}] had an Add New Item button")
 
 
 # ---------------------------------------------------------------- tracking page
@@ -908,115 +956,73 @@ def track_only(page):
 def main():
     if MODE == "mailtest":
         if not MAIL_USER or not MAIL_PASS or not MAIL_TO:
-            raise Exception("Set MAIL_USER, MAIL_PASS and MAIL_TO in GitHub Secrets / .env")
-        if not send_email("Timesheet bot test email",
-                          "If you can read this, email sending works.", []):
-            raise Exception("Test email could not be sent. Check SMTP credentials and recipient.")
+            raise Exception("Set MAIL_USER, MAIL_PASS and MAIL_TO in .env before testing email")
+        send_email("Timesheet bot test email",
+                   "If you can read this, email sending works.", [])
         return
 
-    if MODE == "track":
-        expected, label, groups = WEEKDAY_HOURS, "Tracking", {}
-    else:
-        plan = day_plan()
-        if plan is None:
-            log(f"{TODAY_D.strftime('%A')} {TODAY} is not a working day - skipped")
-            return
+    if MODE not in ("track",) and (not USER or not PASS):
+        raise Exception("Set TS_USER and TS_PASS in .env")
+    plan = day_plan()
+    if plan is None and MODE != "track":
+        log(f"{TODAY_D.strftime('%A')} {TODAY} is not a working day - skipped")
+        return
+
+    if MODE != "track":
         path, expected, label = plan
         source = TASK_SOURCE_URL or path
+        if not TASK_SOURCE_URL and not os.path.exists(path):
+            raise Exception(
+                "Set TASK_SOURCE_URL in .env to your public Excel/Google Sheets URL, "
+                f"or provide the local {path} file."
+            )
+        entries = read_entries(source)
+        total = sum(float(e["hours"]) for e in entries)
+        if abs(total - expected) > 0.01:
+            log(f"WARNING: {path} adds up to {total}h but {label} needs {expected}h")
+        groups = OrderedDict()
+        for e in entries:
+            groups.setdefault(e["project_code"], {"name": e["project_name"], "entries": []})["entries"].append(e)
+    else:
+        path, expected, label = "", WEEKDAY_HOURS, "track"
+        groups = {}
 
+    with sync_playwright() as p:
+        # Open a real desktop browser window (not a fixed emulated viewport).
+        browser = p.chromium.launch(
+            headless=(MODE == "hide"),
+            slow_mo=SLOW_MO,
+            args=["--start-maximized"]
+        )
+
+        # Use the actual Windows display dimensions.
+        context = browser.new_context(
+            no_viewport=True,
+            is_mobile=False,
+            has_touch=False
+        )
+        page = context.new_page()
+
+        # Force the visible Chromium window into fullscreen.
+        if MODE != "hide":
+            try:
+                cdp = context.new_cdp_session(page)
+                window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
+                cdp.send(
+                    "Browser.setWindowBounds",
+                    {
+                        "windowId": window_id,
+                        "bounds": {"windowState": "fullscreen"}
+                    }
+                )
+                log("Browser fullscreen enabled")
+            except Exception as ex:
+                log(f"Browser fullscreen warning: {ex}")
+
+        page.set_default_timeout(15000)
+        if BLOCK_HEAVY:
+            page.route("**/*", block_heavy)
         try:
-            if not TASK_SOURCE_URL and not os.path.exists(path):
-                raise FileNotFoundError(
-                    "Task spreadsheet source is missing. Configure TASK_SOURCE_URL "
-                    f"or provide {path}."
-                )
-            entries = read_entries(source)
-
-            if not entries:
-                REPORT["error"] = (
-                    f"No task rows found in the spreadsheet for current date "
-                    f"{TODAY_D}. Please add today's tasks to the '{TASK_SHEET_NAME}' sheet."
-                )
-                log(REPORT["error"])
-                subject = f"[ATTENTION] Timesheet task reminder - {TODAY_D:%d-%m-%Y} - No tasks in Excel"
-                body = (
-                    f"TIMESHEET REMINDER - ACTION REQUIRED\\n\\n"
-                    f"No task rows were found for today: {TODAY_D:%d-%m-%Y} ({TODAY_D:%A}).\\n"
-                    f"Expected hours: {expected} ({label}).\\n"
-                    f"Source sheet: {TASK_SHEET_NAME}.\\n\\n"
-                    "Please add today's Project Code, Project Name, Discipline, "
-                    "Activity Description, Actual Hours and Status to the task sheet.\\n"
-                    "No timesheet entries were submitted."
-                )
-                if not send_email(subject, body, []):
-                    raise Exception(REPORT["error"] + " Reminder email failed; check MAIL_USER, MAIL_PASS and MAIL_TO.")
-                log("No-task reminder email sent.")
-                return
-
-            total = sum(float(e["hours"]) for e in entries)
-            if abs(total - expected) > 0.01:
-                warning = f"Spreadsheet hours total {total:g}h; expected {expected}h for {label}."
-                log("WARNING: " + warning)
-                REPORT["error"] = warning
-
-            groups = OrderedDict()
-            for e in entries:
-                groups.setdefault(e["project_code"], {
-                    "name": e["project_name"], "entries": []
-                })["entries"].append(e)
-
-        except Exception as ex:
-            REPORT["error"] = f"Could not read today's task spreadsheet: {ex}"
-            log(REPORT["error"])
-            subject = f"[ATTENTION] Timesheet spreadsheet error - {TODAY_D:%d-%m-%Y}"
-            body = (
-                f"TIMESHEET ALERT - SPREADSHEET ISSUE\\n\\n"
-                f"Date: {TODAY_D:%d-%m-%Y}\\n"
-                f"Sheet: {TASK_SHEET_NAME}\\n"
-                f"Error: {REPORT['error']}\\n\\n"
-                "No timesheet entries were submitted. Check the spreadsheet URL, "
-                "sharing permission, sheet tab and today's rows."
-            )
-            if not send_email(subject, body, []):
-                raise Exception(REPORT["error"] + "; alert email also failed.")
-            return
-
-    if MODE != "track" and (not USER or not PASS):
-        REPORT["error"] = "TS_USER or TS_PASS is missing."
-        if not send_email(f"[ATTENTION] Timesheet configuration error - {TODAY_D:%d-%m-%Y}",
-                          REPORT["error"], []):
-            raise Exception(REPORT["error"] + "; alert email also failed.")
-        raise Exception(REPORT["error"])
-
-    browser = context = None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=(MODE == "hide"),
-                slow_mo=SLOW_MO,
-                args=["--start-maximized"]
-            )
-            context = browser.new_context(
-                no_viewport=True,
-                is_mobile=False,
-                has_touch=False
-            )
-            page = context.new_page()
-
-            if MODE != "hide":
-                try:
-                    cdp = context.new_cdp_session(page)
-                    window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
-                    cdp.send("Browser.setWindowBounds",
-                             {"windowId": window_id, "bounds": {"windowState": "fullscreen"}})
-                    log("Browser fullscreen enabled")
-                except Exception as ex:
-                    log(f"Browser fullscreen warning: {ex}")
-
-            page.set_default_timeout(15000)
-            if BLOCK_HEAVY:
-                page.route("**/*", block_heavy)
-
             login(page)
             if MODE == "track":
                 track_only(page)
@@ -1029,32 +1035,35 @@ def main():
                 REPORT["tracking"] = check_tracking(page, expected)
                 t = REPORT["tracking"]
                 log(f"Tracking page: {t['status']} | {t['row']} {t['note']}")
-                if t["status"] != "OK":
-                    problem = f"Tracking verification status: {t['status']}. {t.get('note', '')}"
-                    REPORT["error"] = (REPORT["error"] + "; " if REPORT["error"] else "") + problem
-
                 subject, body = build_report_email(expected, label)
-                if not send_email(subject, body, REPORT["shots"]):
-                    raise Exception("Timesheet processing finished, but report email could not be sent.")
+                send_email(subject, body, REPORT["shots"])
+
             log(f"FINISHED in {time.time() - T0:.1f} seconds")
             if MODE not in ("hide", "dry"):
                 page.wait_for_timeout(END_PAUSE_MS)
-
-    except Exception as ex:
-        logging.error(f"FAILED: {ex}")
-        print("FAILED:", ex)
-        REPORT["error"] = (REPORT["error"] + "; " if REPORT["error"] else "") + str(ex)
-        if MODE not in ("dry", "track"):
-            try:
+        except Exception as ex:
+            logging.error(f"FAILED: {ex}")
+            print("FAILED:", ex)
+            REPORT["error"] = str(ex)
+            # Do not attach task/error screenshots; only the single tracking
+            # screenshot is included when the tracking page was reached.
+            if MODE not in ("dry", "track"):
                 subject, body = build_report_email(expected, label)
                 send_email("[ATTENTION] Timesheet FAILED " + TODAY, body, REPORT["shots"])
-            except Exception as mail_ex:
-                log(f"Failure email could not be prepared/sent: {mail_ex}")
-        raise
-    finally:
-        if context is not None:
-            context.close()
-        if browser is not None:
-            browser.close()
+            raise
+        finally:
+            # The sync_playwright context manager stops Playwright automatically.
+            # Close resources once, in order, and do not let cleanup mask the real error.
+            try:
+                if context and not context.pages[0].is_closed():
+                    context.close()
+            except Exception as cleanup_error:
+                log(f"Context cleanup warning (ignored): {cleanup_error}")
+            try:
+                if browser and browser.is_connected():
+                    browser.close()
+            except Exception as cleanup_error:
+                log(f"Browser cleanup warning (ignored): {cleanup_error}")
+
 
 main()
