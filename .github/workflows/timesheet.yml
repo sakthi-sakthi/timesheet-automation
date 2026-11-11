@@ -28,10 +28,9 @@ jobs:
           pip install playwright python-dotenv
 
       - name: Install Playwright Chromium
-        run: |
-          python -m playwright install chromium
+        run: python -m playwright install chromium
 
-      - name: Verify Playwright installation
+      - name: Verify Playwright
         run: |
           python -c "import playwright; print('Playwright installed successfully')"
           python -m playwright --version
