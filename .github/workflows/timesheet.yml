@@ -29,7 +29,7 @@ jobs:
           TS_PASS: ${{ secrets.TS_PASS }}
           TS_DISPLAY_NAME: ${{ secrets.TS_DISPLAY_NAME }}
           TASK_SOURCE_URL: ${{ secrets.TASK_SOURCE_URL }}
-	  MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python timesheet.py hide
