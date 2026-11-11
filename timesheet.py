@@ -426,88 +426,113 @@ def scroll_tracking_to_today(page):
     return False
 
 
-def save_tracking_screenshots(page):
-    """
-    Capture the tracking screen in readable viewport-sized tiles.
-    This handles both normal page scrolling and nested DataTables/modal scrolling,
-    including date columns that extend horizontally beyond the visible area.
-    Every tile is attached to the same report email.
-    """
-    prepare_desktop_capture(page)
+def current_week_dates():
+    """Monday through Sunday for the current local date."""
+    monday = TODAY_D - datetime.timedelta(days=TODAY_D.weekday())
+    return [monday + datetime.timedelta(days=i) for i in range(7)]
 
-    # Locate the main visible scrollable element (usually the table wrapper).
-    scroll_info = page.evaluate("""() => {
-        const candidates = Array.from(document.querySelectorAll('body *'))
-          .filter(el => {
-            const r = el.getBoundingClientRect();
-            const cs = getComputedStyle(el);
-            return r.width > 80 && r.height > 80 &&
-              (el.scrollHeight > el.clientHeight + 30 ||
-               el.scrollWidth > el.clientWidth + 30) &&
-              /(auto|scroll)/.test(cs.overflowY + ' ' + cs.overflowX);
-          });
-        candidates.sort((a, b) => {
-          const score = el =>
-            (el.scrollHeight - el.clientHeight) +
-            (el.scrollWidth - el.clientWidth) +
-            Math.min(el.clientWidth * el.clientHeight / 1000, 1000);
-          return score(b) - score(a);
+
+def save_tracking_screenshots(page):
+    """Capture only the current week's date columns, with vertical scroll tiles."""
+    prepare_desktop_capture(page)
+    week_dates = current_week_dates()
+    week_labels = []
+    for d in week_dates:
+        week_labels.extend([
+            d.strftime("%d %b").upper(),
+            f"{d.day} {d.strftime('%b').upper()}",
+            d.strftime("%d %B").upper(),
+            f"{d.day} {d.strftime('%B').upper()}"
+        ])
+    week_labels = list(dict.fromkeys(week_labels))
+
+    # Find the main scrollable table container and the first/last current-week
+    # date headers. Keep a little space before Monday for employee columns.
+    scroll_info = page.evaluate("""(labels) => {
+        const norm = s => String(s || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+        const candidates = Array.from(document.querySelectorAll('body *')).filter(el => {
+          const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+          return r.width > 80 && r.height > 80 &&
+            (el.scrollHeight > el.clientHeight + 30 || el.scrollWidth > el.clientWidth + 30) &&
+            /(auto|scroll)/.test(cs.overflowY + ' ' + cs.overflowX);
         });
-        const el = candidates[0];
-        if (!el) return null;
-        if (!el.dataset.tsCaptureId) el.dataset.tsCaptureId = 'ts-capture-target';
+        candidates.sort((a,b) => {
+          const score = el => (el.scrollHeight-el.clientHeight) +
+            (el.scrollWidth-el.clientWidth) + Math.min(el.clientWidth*el.clientHeight/1000,1000);
+          return score(b)-score(a);
+        });
+        const scroller = candidates[0];
+        if (!scroller) return null;
+        if (!scroller.dataset.tsCaptureId) scroller.dataset.tsCaptureId = 'ts-week-capture';
+        const headers = Array.from(document.querySelectorAll('th')).map(el => ({
+          text: norm(el.innerText),
+          x: el.getBoundingClientRect().left - scroller.getBoundingClientRect().left + scroller.scrollLeft,
+          right: el.getBoundingClientRect().right - scroller.getBoundingClientRect().left + scroller.scrollLeft
+        }));
+        const matched = headers.filter(h => labels.some(label => h.text === norm(label) || h.text.startsWith(norm(label) + ' ') || h.text.includes(norm(label))));
         return {
-          selector: '[data-ts-capture-id="ts-capture-target"]',
-          scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
-          scrollWidth: el.scrollWidth, clientWidth: el.clientWidth,
-          tag: el.tagName, id: el.id, className: String(el.className || '').slice(0,120)
+          selector: '[data-ts-capture-id="ts-week-capture"]',
+          sh: scroller.scrollHeight, ch: scroller.clientHeight,
+          sw: scroller.scrollWidth, cw: scroller.clientWidth,
+          firstX: matched.length ? Math.min(...matched.map(h => h.x)) : null,
+          lastRight: matched.length ? Math.max(...matched.map(h => h.right)) : null,
+          matched: matched.map(h => h.text)
         };
-      }""")
+    }""", week_labels)
 
     shots = []
     try:
         if not scroll_info:
-            page.screenshot(path="tracking_01.png", full_page=True,
+            page.screenshot(path="tracking_week_01.png", full_page=True,
                             animations="disabled", type="png")
-            shots.append(("tracking_01.png", "tracking_01.png"))
+            shots.append(("tracking_week_01.png", "tracking_week_01.png"))
         else:
-            selector = scroll_info["selector"]
-            target = page.locator(selector).first
+            target = page.locator(scroll_info["selector"]).first
             dims = target.evaluate("el => ({sh:el.scrollHeight,ch:el.clientHeight,sw:el.scrollWidth,cw:el.clientWidth})")
             max_y = max(0, dims["sh"] - dims["ch"])
-            max_x = max(0, dims["sw"] - dims["cw"])
             step_y = max(250, int(dims["ch"] * 0.78))
-            step_x = max(300, int(dims["cw"] * 0.78))
             y_positions = list(range(0, max_y + 1, step_y)) or [0]
-            x_positions = list(range(0, max_x + 1, step_x)) or [0]
             if y_positions[-1] != max_y:
                 y_positions.append(max_y)
-            if x_positions[-1] != max_x:
-                x_positions.append(max_x)
+
+            # Focus horizontal capture on Monday-Sunday only. If the week spans
+            # more than one viewport, take the minimum number of tiles needed.
+            if scroll_info["firstX"] is not None:
+                start_x = max(0, int(scroll_info["firstX"] - 300))
+                end_x = max(start_x, int(scroll_info["lastRight"] - dims["cw"] + 20))
+                step_x = max(300, int(dims["cw"] * 0.78))
+                x_positions = list(range(start_x, end_x + 1, step_x)) or [start_x]
+                if x_positions[-1] != end_x:
+                    x_positions.append(end_x)
+                log("Current week headers found: " + ", ".join(scroll_info["matched"]))
+            else:
+                # Header labels were not recognized; use one centered view rather
+                # than emailing every historical date column.
+                x_positions = [max(0, min(dims["sw"] - dims["cw"], int((dims["sw"] - dims["cw"]) / 2)))]
+                log("Current-week headers not recognized; captured one centered tracking view")
 
             original = target.evaluate("el => ({x:el.scrollLeft,y:el.scrollTop})")
             index = 0
             for y in y_positions:
                 for x in x_positions:
-                    target.evaluate("(el,p) => {el.scrollTop=p.y; el.scrollLeft=p.x;}", {"x":x,"y":y})
-                    page.wait_for_timeout(300)
+                    target.evaluate("(el,p) => {el.scrollTop=p.y; el.scrollLeft=p.x;}", {"x": x, "y": y})
+                    page.wait_for_timeout(250)
                     index += 1
-                    name = f"tracking_{index:02d}.png"
+                    name = f"tracking_week_{index:02d}.png"
                     page.screenshot(path=name, full_page=False,
                                     animations="disabled", type="png")
                     shots.append((name, name))
-                    log(f"Tracking screenshot tile {index}: scrollX={x}, scrollY={y}")
-            # Restore the tracking screen to its original scroll position.
+                    log(f"Current-week screenshot {index}: scrollX={x}, scrollY={y}")
             target.evaluate("(el,p) => {el.scrollTop=p.y; el.scrollLeft=p.x;}", original)
     except Exception as ex:
-        log(f"Tracking scroll capture warning: {ex}")
+        log(f"Current-week screenshot warning: {ex}")
         if not shots:
-            page.screenshot(path="tracking_01.png", full_page=False,
+            page.screenshot(path="tracking_week_01.png", full_page=False,
                             animations="disabled", type="png")
-            shots.append(("tracking_01.png", "tracking_01.png"))
+            shots.append(("tracking_week_01.png", "tracking_week_01.png"))
 
     REPORT["shots"] = shots
-    log(f"Saved {len(shots)} tracking screenshot tile(s)")
+    log(f"Saved {len(shots)} current-week tracking screenshot(s)")
     return scroll_tracking_to_today(page)
 
 
@@ -561,7 +586,7 @@ def build_report_html():
 <h3>Tracking</h3>
 <p><b>Status:</b> {esc(tracking.get('status','UNKNOWN'))}</p>
 <p><b>Today's tracking row:</b> {esc(tracking.get('row','Not available'))}</p>
-<p style="color:#667085">Tracking page screenshots are attached in scroll sections so dates hidden by scrolling can be reviewed.</p>
+<p style="color:#667085">Only the current Monday-Sunday tracking dates are attached, across vertical scroll sections.</p>
 </body></html>"""
 
 
@@ -628,7 +653,7 @@ def build_report_email(expected, label):
     for project, hours in project_totals.items():
         lines.append(f"  {project}: {hours:g} hrs")
     lines.append(f"Total hours in this run: {total:g} hrs")
-    lines.append("Tracking page screenshots attached as scrollable viewport sections, including horizontally and vertically hidden content.")
+    lines.append("Current-week tracking screenshots attached (Monday-Sunday), split only where vertical scrolling is required.")
     return subject, "\n".join(lines)
 
 
