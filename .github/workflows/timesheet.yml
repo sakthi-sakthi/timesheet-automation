@@ -4,10 +4,13 @@ name: Daily Timesheet Automation
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   timesheet:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -17,13 +20,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install playwright python-dotenv
-          playwright install --with-deps chromium
 
-      - name: Run Timesheet
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install chromium
+
+      - name: Verify Playwright installation
+        run: |
+          python -c "import playwright; print('Playwright installed successfully')"
+          python -m playwright --version
+
+      - name: Run Timesheet Automation
         env:
           TS_USER: ${{ secrets.TS_USER }}
           TS_PASS: ${{ secrets.TS_PASS }}
