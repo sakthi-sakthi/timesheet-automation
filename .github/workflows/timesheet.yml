@@ -3,6 +3,8 @@ name: Daily Timesheet Automation
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '30 10 * * 1-6'
 
 jobs:
   timesheet:
