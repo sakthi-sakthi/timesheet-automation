@@ -126,6 +126,87 @@ def normalize_task_row(row):
     }
 
 
+# Maximum actual hours accepted by the portal for ONE time-log row.
+# Larger source tasks are split into balanced rows; total hours are preserved.
+MAX_HOURS_PER_ENTRY = 5.0
+
+
+def split_long_task_entries(entries):
+    """
+    Split any task above the per-row portal limit into balanced entries.
+
+    Examples:
+      6h  -> 3h + 3h
+      7h  -> 3.5h + 3.5h
+      11h -> 3.67h + 3.67h + 3.66h
+
+    The first row keeps the original description. Additional rows retain the
+    same project and discipline and get a clear continuation suffix.
+    """
+    split_entries = []
+
+    for entry in entries:
+        total_hours = float(entry["hours"])
+
+        if total_hours <= MAX_HOURS_PER_ENTRY:
+            split_entries.append(dict(entry))
+            continue
+
+        parts = int((total_hours + MAX_HOURS_PER_ENTRY - 1e-9) // MAX_HOURS_PER_ENTRY)
+        parts = max(parts, 2)
+
+        # Balance the hours across the minimum number of rows needed.
+        # Round all but the final part to 2 decimals; put the remainder in
+        # the final part so the original total is preserved exactly to cents.
+        base = round(total_hours / parts, 2)
+        remaining = round(total_hours, 2)
+
+        for index in range(parts):
+            if index == parts - 1:
+                part_hours = round(remaining, 2)
+            else:
+                part_hours = base
+                remaining = round(remaining - part_hours, 2)
+
+            if part_hours <= 0 or part_hours > MAX_HOURS_PER_ENTRY:
+                raise ValueError(
+                    f"Could not safely split {entry['desc']} ({total_hours:g}h) "
+                    f"into rows of at most {MAX_HOURS_PER_ENTRY:g}h."
+                )
+
+            part = dict(entry)
+            part["hours"] = f"{part_hours:g}"
+
+            if index > 0:
+                part["desc"] = (
+                    f"{entry['desc']} – Additional work (Part {index + 1})"
+                )
+
+            split_entries.append(part)
+
+        log(
+            f"Split task: {entry['desc']} | {total_hours:g}h into "
+            + " + ".join(
+                f"{split_entries[-parts + i]['hours']}h"
+                for i in range(parts)
+            )
+        )
+
+    original_total = round(sum(float(e["hours"]) for e in entries), 2)
+    split_total = round(sum(float(e["hours"]) for e in split_entries), 2)
+
+    if original_total != split_total:
+        raise ValueError(
+            f"Task splitting changed total hours: "
+            f"original={original_total:g}h, split={split_total:g}h"
+        )
+
+    if any(float(e["hours"]) > MAX_HOURS_PER_ENTRY for e in split_entries):
+        raise ValueError("A split entry still exceeds the 5-hour portal row limit.")
+
+    return split_entries
+
+
 def read_csv_bytes(raw):
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
     return [normalize_task_row({str(k).strip().lower(): v for k, v in row.items()})
@@ -1078,7 +1159,19 @@ def main():
                 f"or provide the local {path} file."
             )
         entries = read_entries(source)
+
+        # Portal rule: maximum 5 hours per individual time-log row.
+        # Split long tasks into balanced rows without changing their total.
+        source_total = sum(float(e["hours"]) for e in entries)
+        entries = split_long_task_entries(entries)
         total = sum(float(e["hours"]) for e in entries)
+
+        if round(source_total, 2) != round(total, 2):
+            raise ValueError(
+                f"Hours changed during splitting: source={source_total:g}h, "
+                f"prepared={total:g}h"
+            )
+
         # Expected hours are a MINIMUM, never a maximum. Extra hours are valid.
         if total + 0.01 < expected:
             log(f"WARNING: {path} adds up to {total:g}h; {label} minimum is {expected}h")
