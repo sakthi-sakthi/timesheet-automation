@@ -131,6 +131,27 @@ def normalize_task_row(row):
 MAX_HOURS_PER_ENTRY = 5.0
 
 
+def hours_to_portal_time(hours):
+    """Convert decimal hours from the sheet to the portal's HH:MM format.
+
+    Examples: 0.5 -> 00:30, 1 -> 01:00, 1.5 -> 01:30, 5 -> 05:00.
+    The portal time inputs must never receive decimal strings such as '0.5'.
+    """
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+    try:
+        value = Decimal(str(hours))
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"Invalid hours value for portal time field: {hours}")
+
+    if value <= 0:
+        raise ValueError(f"Hours must be greater than zero: {hours}")
+
+    total_minutes = int((value * Decimal("60")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    whole_hours, minutes = divmod(total_minutes, 60)
+    return f"{whole_hours:02d}:{minutes:02d}"
+
+
 def split_long_task_entries(entries):
     """
     Split any task above the per-row portal limit into balanced entries.
@@ -205,6 +226,7 @@ def split_long_task_entries(entries):
         raise ValueError("A split entry still exceeds the 5-hour portal row limit.")
 
     return split_entries
+
 
 
 def read_csv_bytes(raw):
@@ -976,10 +998,14 @@ def fill_current_task(page, entries):
                 add_row(page)
             page.evaluate(PICK_JS, ["#discipline", e["discipline"]])
             page.locator("#description").last.fill(e["desc"])
-            page.locator("#scduledHours").last.fill(e["hours"])
-            page.locator("#actualHours").last.fill(e["hours"])
+            portal_time = hours_to_portal_time(e["hours"])
+            page.locator("#scduledHours").last.fill(portal_time)
+            page.locator("#actualHours").last.fill(portal_time)
             page.evaluate(PICK_JS, ["#status", e["status"]])
-            log(f"Filled: {e['discipline']} | {e['hours']}h | {e['status']}")
+            log(
+                f"Filled: {e['discipline']} | {e['desc']} | "
+                f"{e['hours']}h => {portal_time} | {e['status']}"
+            )
     except Exception:
         dump_form(page)
         raise
@@ -1160,16 +1186,25 @@ def main():
             )
         entries = read_entries(source)
 
-        # Portal rule: maximum 5 hours per individual time-log row.
-        # Split long tasks into balanced rows without changing their total.
+        # Keep every source task as a separate portal task entry.
+        # Only split an individual task when it exceeds the portal's 5-hour
+        # per-row limit. Decimal hours are converted to HH:MM at form fill time.
         source_total = sum(float(e["hours"]) for e in entries)
         entries = split_long_task_entries(entries)
         total = sum(float(e["hours"]) for e in entries)
 
         if round(source_total, 2) != round(total, 2):
             raise ValueError(
-                f"Hours changed during splitting: source={source_total:g}h, "
-                f"prepared={total:g}h"
+                f"Hours changed during task splitting: "
+                f"source={source_total:g}h, prepared={total:g}h"
+            )
+
+        # Convert decimal hours to HH:MM before sending values to the portal.
+        for entry in entries:
+            log(
+                f"Prepared task entry: {entry['project_code']} | "
+                f"{entry['desc']} | {entry['hours']}h "
+                f"=> {hours_to_portal_time(entry['hours'])}"
             )
 
         # Expected hours are a MINIMUM, never a maximum. Extra hours are valid.
