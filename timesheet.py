@@ -1,5 +1,6 @@
 import os, re, sys, time, smtplib, datetime, logging
 from collections import OrderedDict
+from pathlib import Path
 from email.message import EmailMessage
 import csv, io, urllib.request, urllib.parse
 from dotenv import load_dotenv
@@ -767,12 +768,77 @@ def todays_hours(page):
     return total
 
 
+def _timesheet_field_counts(page):
+    """Return counts for the repeated controls in the time-log form."""
+    return page.evaluate("""() => ({
+        discipline: document.querySelectorAll('#discipline').length,
+        description: document.querySelectorAll('#description').length,
+        scheduled: document.querySelectorAll('#scduledHours').length,
+        actual: document.querySelectorAll('#actualHours').length,
+        status: document.querySelectorAll('#status').length
+    })""")
+
+
 def add_row(page):
-    before = page.locator("#discipline").count()
-    page.click("#Addrows")
-    page.wait_for_function(
-        "n => document.querySelectorAll('#discipline').length > n", arg=before,
-        timeout=8000)
+    """Add exactly one time-log row and wait until its controls are present.
+
+    The old implementation waited only 8 seconds for #discipline. On slower
+    responses, or when the button's normal click handler did not fire, it
+    failed without useful diagnostics. This version waits longer, checks all
+    repeated form controls, and performs one JS-click fallback only after the
+    first click has clearly produced no new row.
+    """
+    button = page.locator("#Addrows").first
+    if button.count() == 0:
+        raise RuntimeError("Add New Item button (#Addrows) was not found.")
+    if not button.is_visible():
+        raise RuntimeError("Add New Item button (#Addrows) is not visible.")
+
+    before = _timesheet_field_counts(page)
+
+    def wait_for_new_row(timeout_ms):
+        page.wait_for_function(
+            """before => {
+                const now = {
+                    discipline: document.querySelectorAll('#discipline').length,
+                    description: document.querySelectorAll('#description').length,
+                    scheduled: document.querySelectorAll('#scduledHours').length,
+                    actual: document.querySelectorAll('#actualHours').length,
+                    status: document.querySelectorAll('#status').length
+                };
+                return Object.keys(now).some(key => now[key] > (before[key] || 0));
+            }""",
+            arg=before,
+            timeout=timeout_ms
+        )
+
+    # First use a real browser click so normal mouse and application events fire.
+    button.scroll_into_view_if_needed(timeout=5000)
+    button.click(timeout=10000)
+    try:
+        wait_for_new_row(12000)
+    except Exception:
+        # The first click did not add any repeated controls. Try the element's
+        # native click handler once; do not keep clicking (that could add extras).
+        current = _timesheet_field_counts(page)
+        if any(current[k] > before[k] for k in before):
+            log("New row controls appeared after the initial click.")
+            return
+        page.locator("#Addrows").first.evaluate("el => el.click()")
+        try:
+            wait_for_new_row(10000)
+        except Exception as ex:
+            after = _timesheet_field_counts(page)
+            dump_form(page)
+            raise RuntimeError(
+                "Could not add a new time-log row. "
+                f"Field counts before={before}, after={after}. "
+                "Debug files form_debug.txt and form_debug.png were saved. "
+                "Please verify the Add New Item button and page response."
+            ) from ex
+
+    after = _timesheet_field_counts(page)
+    log(f"New time-log row added. Field counts: {after}")
 
 
 def fill_current_task(page, entries):
@@ -800,8 +866,18 @@ def fill_current_task(page, entries):
     need = sum(float(e["hours"]) for e in entries)
     done = todays_hours(page)
     if done >= need:
-        log(f"Already {done}h logged for {TODAY} on this task - nothing to do")
+        log(f"Already {done:g}h logged for {TODAY} on this task - nothing to do")
         return "done"
+    if done > 0:
+        # The current history parser can verify the total, but cannot reliably
+        # map each saved history row back to each source description. Stop here
+        # rather than re-entering all entries and creating duplicate hours.
+        log(
+            f"PARTIAL ENTRY DETECTED: {done:g}h already logged, while this run "
+            f"expects {need:g}h. Skipping this task to prevent duplicate entries; "
+            "please compare the portal rows with Daily Tasks manually."
+        )
+        return "partial"
 
     date_box = page.locator("#currentdate")
     if date_box.count() > 0:
@@ -869,7 +945,7 @@ def process_project(page, project_code, project_name, ents):
         if result == "dry":
             input("Check the browser, then press Enter to continue... ")
             return
-        if result in ("saved", "done"):
+        if result in ("saved", "done", "partial"):
             REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
                                         result=result, entries=ents))
             return
@@ -1003,8 +1079,11 @@ def main():
             )
         entries = read_entries(source)
         total = sum(float(e["hours"]) for e in entries)
-        if abs(total - expected) > 0.01:
-            log(f"WARNING: {path} adds up to {total}h but {label} needs {expected}h")
+        # Expected hours are a MINIMUM, never a maximum. Extra hours are valid.
+        if total + 0.01 < expected:
+            log(f"WARNING: {path} adds up to {total:g}h; {label} minimum is {expected}h")
+        else:
+            log(f"Hours validation passed: {total:g}h (minimum {expected}h; no upper cap)")
         groups = OrderedDict()
         for e in entries:
             groups.setdefault(e["project_code"], {"name": e["project_name"], "entries": []})["entries"].append(e)
