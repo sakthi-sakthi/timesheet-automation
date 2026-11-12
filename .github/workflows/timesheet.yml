@@ -44,3 +44,17 @@ jobs:
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python timesheet.py hide
+
+      - name: Upload Timesheet Debug Files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timesheet-debug
+          path: |
+            form_debug.txt
+            form_debug.png
+            debug_page.txt
+            debug_page.png
+            timesheet.log
+          if-no-files-found: ignore
+          retention-days: 7
