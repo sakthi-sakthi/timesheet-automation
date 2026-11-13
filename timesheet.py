@@ -1080,16 +1080,38 @@ def fill_current_task(page, entries):
                 consecutive = 0
         except Exception as ex:
             log(f"Waiting for saved history to load: {ex}")
-        # A server-side validation message should fail promptly, not wait the full timeout.
+        # Detect actual server-side validation messages only.
+        # Do NOT inspect generic .text-danger: this portal uses that class for
+        # required-field asterisks ("*"), which are decorations, not errors.
         try:
-            alert_text = page.locator(".alert-danger, .text-danger, .validation-summary-errors").all_inner_texts()
-            errors = [x.strip() for x in alert_text if x.strip()]
+            candidates = page.locator(
+                ".alert-danger, .validation-summary-errors, "
+                ".field-validation-error, [role='alert'], .toast-error, "
+                ".swal2-validation-message"
+            ).all_inner_texts()
+            errors = []
+            for raw in candidates:
+                message = " ".join(str(raw).split()).strip()
+                # Ignore empty content and required-marker-only text.
+                if not message or message in {"*", "＊", "•", "·"}:
+                    continue
+                # Ignore generic labels that are not actionable validation text.
+                if len(message) == 1 and not message.isalnum():
+                    continue
+                if message not in errors:
+                    errors.append(message)
+
             if errors:
-                raise RuntimeError("Portal validation error after save: " + " | ".join(errors)[:1000])
+                dump_form(page)
+                dump_debug(page, "debug_page")
+                raise RuntimeError(
+                    "Portal returned an actual validation message after save: "
+                    + " | ".join(errors)[:1000]
+                )
         except RuntimeError:
             raise
-        except Exception:
-            pass
+        except Exception as ex:
+            log(f"Validation-message inspection warning (continuing save verification): {ex}")
 
     dump_form(page)
     raise RuntimeError(
