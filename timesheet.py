@@ -390,78 +390,75 @@ def make_descriptions_unique(entries, reserved_descriptions=None):
 
 def portal_existing_descriptions(page):
     """
-    Read descriptions already saved in the currently opened portal task page.
-
-    Preferred method: use the table's Description/Activity/Task column header.
-    Fallback: read non-visible historical #description controls, excluding
-    the visible editable form row. If the portal markup cannot be identified,
-    return an empty list and log a warning rather than guessing from unrelated
-    table columns.
+    Read every saved Activity Description from the task history, regardless
+    of date. Historical descriptions are rendered as visible input values in
+    this portal, so reading td.innerText alone misses them.
     """
-    try:
-        found = page.evaluate("""() => {
-            const values = new Set();
-            const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+    page.wait_for_selector("#SaveTimelog", state="visible", timeout=15000)
+    found = page.evaluate("""() => {
+        const values = new Set();
+        const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
 
-            // Existing historical rows: identify the description column by
-            // its header text, then read that column from body rows.
-            for (const table of Array.from(document.querySelectorAll('table'))) {
-                const headerRows = Array.from(table.querySelectorAll('thead tr'));
-                const allRows = Array.from(table.querySelectorAll('tr'));
-                let header = headerRows.length ? headerRows[headerRows.length - 1] : null;
+        // Read values from all historical description inputs. Exclude only
+        // the current editable entry row (the row containing #discipline).
+        for (const el of Array.from(document.querySelectorAll('#description'))) {
+            const row = el.closest('tr');
+            const currentEntryRow = row && row.querySelector('#discipline');
+            if (currentEntryRow) continue;
 
-                if (!header) {
-                    header = allRows.find(row =>
-                        Array.from(row.querySelectorAll('th')).length > 0
-                    ) || null;
-                }
-                if (!header) continue;
+            const value = norm(
+                ('value' in el ? el.value : '') ||
+                el.innerText || el.textContent || el.getAttribute('value')
+            );
+            if (value) values.add(value);
+        }
 
-                const headers = Array.from(header.querySelectorAll('th, td'))
-                    .map(cell => norm(cell.innerText || cell.textContent).toLowerCase());
-                const index = headers.findIndex(text =>
-                    /description|activity|task name|task details/.test(text)
+        // Also support portals that render historical descriptions as text
+        // instead of input controls. Find the Activity Description column.
+        for (const table of Array.from(document.querySelectorAll('table'))) {
+            const rows = Array.from(table.querySelectorAll('tr'));
+            const header = rows.find(row =>
+                Array.from(row.querySelectorAll('th,td')).some(cell =>
+                    /activity description|description/i.test(norm(cell.innerText || cell.textContent))
+                )
+            );
+            if (!header) continue;
+
+            const headers = Array.from(header.querySelectorAll('th,td'));
+            const col = headers.findIndex(cell =>
+                /activity description|description/i.test(norm(cell.innerText || cell.textContent))
+            );
+            if (col < 0) continue;
+
+            for (const row of rows) {
+                if (row === header || row.querySelector('#discipline')) continue;
+                const cells = Array.from(row.querySelectorAll(':scope > td'));
+                if (cells.length <= col) continue;
+                const cell = cells[col];
+                const control = cell.querySelector('input,textarea');
+                const value = norm(
+                    (control && ('value' in control ? control.value : '')) ||
+                    cell.innerText || cell.textContent
                 );
-                if (index < 0) continue;
-
-                for (const row of allRows) {
-                    if (row === header || row.querySelector('th')) continue;
-                    const cells = Array.from(row.querySelectorAll(':scope > td'));
-                    if (cells.length <= index) continue;
-                    const value = norm(cells[index].innerText || cells[index].textContent);
-                    if (value) values.add(value);
-                }
-            }
-
-            // Some portal versions render saved descriptions as disabled or
-            // read-only inputs instead of plain table cells.
-            for (const el of Array.from(document.querySelectorAll('#description'))) {
-                if (el.offsetParent !== null && !el.disabled && !el.readOnly) continue;
-                const value = norm(el.value || el.innerText || el.textContent);
                 if (value) values.add(value);
             }
+        }
 
-            // Exclude obvious header labels accidentally collected as values.
-            return Array.from(values).filter(value =>
-                !/^(description|activity|task name|task details)$/i.test(value)
-            );
-        }""")
-        cleaned = [
-            " ".join(str(value).split()).strip()
-            for value in (found or [])
-            if " ".join(str(value).split()).strip()
-        ]
-        log(
-            f"Portal history duplicate check: {len(cleaned)} existing "
-            "description(s) found on this task page."
-        )
-        return cleaned
-    except Exception as ex:
-        log(
-            "WARNING: Could not read existing portal descriptions on this "
-            f"task page; only import-batch duplicate protection applies. Reason: {ex}"
-        )
-        return []
+        return Array.from(values);
+    }""")
+
+    cleaned = [
+        " ".join(str(value).split()).strip()
+        for value in (found or [])
+        if " ".join(str(value).split()).strip()
+    ]
+    log(
+        f"Portal history scan: {len(cleaned)} saved description(s) read "
+        "(all dates; input values + table text)."
+    )
+    if cleaned:
+        log("Portal history descriptions: " + " | ".join(cleaned[:30]))
+    return cleaned
 
 
 def read_entries(source):
@@ -1203,10 +1200,54 @@ def fill_current_task(page, entries):
         )
 
     date_box = page.locator("#currentdate")
-    if date_box.count() > 0:
-        cur = date_box.first.input_value(timeout=3000)
-        if cur != TODAY:
-            date_box.first.fill(TODAY, timeout=5000)
+    if date_box.count() == 0:
+        raise RuntimeError(
+            "Portal date control #currentdate was not found. "
+            "Stopped before entering actual hours."
+        )
+
+    date_control = date_box.first
+    date_type = (date_control.get_attribute("type") or "").lower()
+    expected_date_value = TODAY_D.strftime("%Y-%m-%d") if date_type == "date" else TODAY
+    current_date_value = date_control.input_value(timeout=3000).strip()
+
+    # Log browser-side clock and portal date. Do not try to bypass the portal's
+    # server-side next-day restriction by selecting a different date.
+    browser_clock = page.evaluate("""() => ({
+        local: new Date().toString(),
+        iso: new Date().toISOString(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+    })""")
+    log(
+        f"Portal date preflight: field={current_date_value!r}, "
+        f"expected India date={expected_date_value!r}, browser={browser_clock}"
+    )
+
+    if current_date_value != expected_date_value:
+        if date_control.is_disabled() or date_control.get_attribute("readonly") is not None:
+            raise RuntimeError(
+                f"Portal date is {current_date_value!r}, expected {expected_date_value!r}, "
+                "and the date field is disabled/read-only. Stopped without saving."
+            )
+        date_control.fill(expected_date_value, timeout=5000)
+        current_date_value = date_control.input_value(timeout=3000).strip()
+
+    if current_date_value != expected_date_value:
+        raise RuntimeError(
+            f"Portal date verification failed: {current_date_value!r}; "
+            f"expected {expected_date_value!r}. Stopped without saving."
+        )
+
+    # If the portal is already displaying its next-day validation banner,
+    # do not fill/save another batch and risk repeating the rejected submission.
+    existing_page_message = page.locator("body").inner_text(timeout=5000)
+    if "actual hours cannot be entered next day" in existing_page_message.lower():
+        raise RuntimeError(
+            "Portal is already displaying the next-day actual-hours restriction. "
+            "Stopped before entering or saving any rows. The browser date and "
+            "date field are logged above, but the portal's server-side date/time "
+            "or attendance cutoff must be checked by the portal administrator."
+        )
 
     try:
         for i, e in enumerate(entries):
@@ -1343,10 +1384,31 @@ def process_project(page, project_code, project_name, ents):
         if idx > 0:
             open_board(page, project_code, project_name)
         log(f"Opening task for project {project_code}: {c['title']}")
-        page.evaluate(CLICK_HREF_JS, c["href"])
 
-        # Compare imported descriptions against saved descriptions visible in
-        # this portal task's history before filling any editable rows.
+        # Use Playwright click so navigation is awaited instead of executing
+        # page.evaluate immediately after a DOM click (which destroyed context).
+        matching_link = None
+        links = page.locator("a[href]")
+        for link_index in range(links.count()):
+            candidate = links.nth(link_index)
+            if candidate.get_attribute("href") == c["href"]:
+                matching_link = candidate
+                break
+        if matching_link is None:
+            raise RuntimeError(f"Could not find task link: {c['href']}")
+
+        try:
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
+                matching_link.click(timeout=10000)
+        except Exception:
+            # Some portal builds update the content without a full navigation.
+            pass
+
+        page.wait_for_selector("#SaveTimelog", state="visible", timeout=20000)
+        log(f"Task page loaded: {page.url}")
+
+        # Compare new descriptions with ALL saved descriptions on this task,
+        # including entries from previous dates.
         existing_portal_descriptions = portal_existing_descriptions(page)
         task_entries = make_descriptions_unique(
             ents,
