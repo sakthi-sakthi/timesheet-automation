@@ -893,7 +893,13 @@ def _timesheet_field_counts(page):
 
 
 def add_row(page):
-    """Add one row and wait until every repeated control has the same new count."""
+    """Add one row and wait until every required control gains one instance.
+
+    These selectors are not guaranteed to have equal baseline counts: for example,
+    #description may also match static/search fields outside the repeated row.
+    Therefore compare each selector with its own pre-click count rather than
+    requiring all selector counts to be identical.
+    """
     button = page.locator("#Addrows").first
     if button.count() == 0 or not button.is_visible():
         raise RuntimeError("Add New Item button (#Addrows) was not found or is not visible.")
@@ -911,8 +917,7 @@ def add_row(page):
                     actual: document.querySelectorAll('#actualHours').length,
                     status: document.querySelectorAll('#status').length
                 };
-                return Object.keys(expected).every(key => now[key] >= expected[key]) &&
-                       Object.keys(now).every(key => now[key] === now.discipline);
+                return Object.keys(expected).every(key => now[key] >= expected[key]);
             }""",
             arg=expected, timeout=timeout_ms
         )
@@ -936,9 +941,13 @@ def add_row(page):
             raise RuntimeError(f"Could not add a complete time-log row. Before={before}; after={after}.") from ex
 
     after = _timesheet_field_counts(page)
-    if len(set(after.values())) != 1 or after["discipline"] != before["discipline"] + 1:
+    missing = [key for key in before if after[key] < before[key] + 1]
+    if missing:
         dump_form(page)
-        raise RuntimeError(f"Time-log row controls are inconsistent: {after}")
+        raise RuntimeError(
+            f"New row is missing required controls {missing}. "
+            f"Before={before}; after={after}."
+        )
     log(f"Complete new time-log row added. Field counts: {after}")
 
 
