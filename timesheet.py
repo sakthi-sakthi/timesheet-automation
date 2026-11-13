@@ -1151,6 +1151,7 @@ def fill_current_task(page, entries):
             break
         page.wait_for_timeout(300)
 
+    expected_after = done + need
     visible_text = body_text(page)
     validation_phrases = (
         "please enter a different description",
@@ -1160,16 +1161,19 @@ def fill_current_task(page, entries):
         "validation error",
     )
     found_errors = [phrase for phrase in validation_phrases if phrase in visible_text]
-    if found_errors:
-        dump_form(page)
-        raise RuntimeError(
-            "Portal rejected the timesheet save: " + "; ".join(found_errors)
-            + ". No successful save will be reported."
-        )
 
-    expected_after = done + need
+    # The portal can leave an old/stale validation message in the page after
+    # successfully persisting the rows. Persisted hours are the source of truth:
+    # only treat the message as a save failure when the expected hours are absent.
     if after + 0.01 < expected_after:
         dump_form(page)
+        if found_errors:
+            raise RuntimeError(
+                "Portal save was not confirmed. Validation message(s): "
+                + "; ".join(found_errors)
+                + f". Before save={done:g}h, expected={expected_after:g}h, "
+                f"portal shows={after:g}h. Check the portal before retrying."
+            )
         raise RuntimeError(
             f"Save could not be verified. Before save={done:g}h, "
             f"expected after save={expected_after:g}h, portal shows={after:g}h. "
@@ -1177,6 +1181,12 @@ def fill_current_task(page, entries):
             "See form_debug.txt/png and verify the portal manually."
         )
 
+    if found_errors:
+        log(
+            "WARNING: A validation phrase remains in the page, but the portal's "
+            f"saved-hours total confirms this batch persisted ({after:g}h). "
+            "Continuing to the next project."
+        )
     log(f"Save verified - {after:g}h now logged for {TODAY}")
     return "saved"
 
