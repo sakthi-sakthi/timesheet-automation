@@ -867,15 +867,47 @@ def in_range(card):
 
 
 def todays_hours(page):
-    rows = safe_eval(page, ROWS_JS)
+    """
+    Read today's actual hours from the portal table.
+
+    IMPORTANT: this page renders Date and Actual Hours as input controls.
+    tr.innerText does not include input.value, so the old parser incorrectly
+    returned 0 even when the portal had saved the rows.
+    """
+    rows = safe_eval(page, """() => Array.from(document.querySelectorAll('tr')).map(tr => {
+        const dateInput = tr.querySelector('input#currentdate, input[name="currentdate"]');
+        const actualInput = tr.querySelector('input#actualHours, input[name="actualHours"]');
+
+        const dateCell = dateInput ? dateInput.value :
+            (tr.cells && tr.cells.length ? tr.cells[0].innerText.trim() : '');
+
+        // Actual-hours column is the fifth visible column in this portal table.
+        // Prefer the named input; fall back to the cell's text if it is read-only.
+        let actualValue = actualInput ? actualInput.value : '';
+        if (!actualValue && tr.cells && tr.cells.length > 4) {
+            const actualCell = tr.cells[4];
+            const cellInput = actualCell.querySelector('input');
+            actualValue = cellInput ? cellInput.value : actualCell.innerText.trim();
+        }
+
+        return { date: (dateCell || '').trim(), actual: (actualValue || '').trim() };
+    })""")
+
     total = 0.0
-    for r in rows:
-        if r.strip().startswith(TODAY):
-            for tok in r.split():
-                if len(tok) == 5 and tok[2] == ":" and tok.replace(":", "").isdigit():
-                    h, m = tok.split(":")
-                    total += int(h) + int(m) / 60
-                    break
+    for row in rows:
+        row_date = str(row.get("date", "")).strip()
+        actual = str(row.get("actual", "")).strip()
+
+        if row_date != TODAY:
+            continue
+
+        # Accept portal time values such as HH:MM.
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", actual)
+        if match:
+            hours, minutes = map(int, match.groups())
+            if 0 <= minutes < 60:
+                total += hours + minutes / 60
+
     return total
 
 
@@ -1139,8 +1171,18 @@ def fill_current_task(page, entries):
 
     page.click("#SaveTimelog")
 
-    # Wait for the portal to finish its save/validation response.
+    # Capture the immediate response, then reload the same task page before
+    # checking hours. This prevents unsaved values still sitting in editable
+    # inputs from being mistaken for persisted database records.
     page.wait_for_timeout(1200)
+    immediate_response_text = body_text(page)
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=20000)
+        settle(page)
+        page.wait_for_timeout(700)
+    except Exception as reload_ex:
+        log(f"Could not reload task page for persisted-save verification: {reload_ex}")
+
     after = 0.0
     for _ in range(28):
         try:
@@ -1152,7 +1194,7 @@ def fill_current_task(page, entries):
         page.wait_for_timeout(300)
 
     expected_after = done + need
-    visible_text = body_text(page)
+    visible_text = immediate_response_text + "\\n" + body_text(page)
     validation_phrases = (
         "please enter a different description",
         "actual hours cannot be entered next day",
