@@ -22,7 +22,8 @@ MAIL_PASS = os.environ.get("MAIL_PASS", "")
 MAIL_TO = os.environ.get("MAIL_TO", "")
 
 BASE = "https://bsoftagile.boscosofttech.com/"
-TODAY_D = datetime.date.today()
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+TODAY_D = datetime.datetime.now(IST).date()
 TODAY = TODAY_D.strftime("%d/%m/%Y")
 
 # ---- Working-day rules -------------------------------------------------
@@ -31,13 +32,17 @@ SATURDAY_HOURS = 6           # working Saturdays only
 WORKING_SATURDAYS = (2, 4)   # which Saturdays of the month are working days
 # ------------------------------------------------------------------------
 
-# Modes:
-#   python timesheet.py          visible browser, SAVES, checks tracking, emails
-#   python timesheet.py dry      visible browser, fills only (no save, no email)
-#   python timesheet.py hide     no window (for the scheduler), SAVES, emails
-#   python timesheet.py track    only opens the tracking page and saves what it sees
-#   python timesheet.py mailtest only sends a test email
-MODE = sys.argv[1] if len(sys.argv) > 1 else "run"
+# LIVE MODE:
+#   python timesheet.py          visible browser, SAVES entries, checks tracking, emails
+#   python timesheet.py hide     hidden browser, SAVES entries, checks tracking, emails
+#   python timesheet.py track    tracking-page inspection only
+#   python timesheet.py mailtest sends a test email only
+# There is NO dry mode in this version. Normal execution saves to the portal.
+MODE = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "run"
+if MODE == "dry":
+    raise SystemExit("Dry mode has been removed. Run: python timesheet.py")
+if MODE not in ("run", "hide", "track", "mailtest"):
+    raise SystemExit(f"Unknown mode '{MODE}'. Use run, hide, track, or mailtest.")
 SLOW_MO = 0
 END_PAUSE_MS = 2000
 BLOCK_HEAVY = True
@@ -228,45 +233,6 @@ def split_long_task_entries(entries):
     return split_entries
 
 
-
-def combine_project_tasks(entries):
-    """Combine all same-project, same-discipline source tasks into one description/hour total.
-
-    Separate disciplines remain separate because the portal requires one discipline
-    selection per time-log row. Duplicate descriptions are listed only once, while
-    their hours are still included in the total.
-    """
-    combined = OrderedDict()
-    for entry in entries:
-        key = (entry["project_code"], entry["discipline"])
-        if key not in combined:
-            combined[key] = {
-                "project": entry["project"],
-                "project_code": entry["project_code"],
-                "project_name": entry["project_name"],
-                "discipline": entry["discipline"],
-                "descriptions": [],
-                "hours_total": 0.0,
-                "status": entry.get("status", "Completed"),
-            }
-        item = combined[key]
-        description = entry["desc"].strip()
-        if description and description not in item["descriptions"]:
-            item["descriptions"].append(description)
-        item["hours_total"] += float(entry["hours"])
-
-    result = []
-    for item in combined.values():
-        result.append({
-            "project": item["project"],
-            "project_code": item["project_code"],
-            "project_name": item["project_name"],
-            "discipline": item["discipline"],
-            "desc": "Combined tasks: " + "; ".join(item["descriptions"]),
-            "hours": f"{item['hours_total']:.2f}".rstrip("0").rstrip("."),
-            "status": item["status"],
-        })
-    return result
 
 def read_csv_bytes(raw):
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
@@ -1168,24 +1134,47 @@ def fill_current_task(page, entries):
         dump_form(page)
         raise
 
-    if MODE == "dry":
-        log("DRY mode - Save NOT clicked")
-        return "dry"
-
     page.click("#SaveTimelog")
+
+    # Wait for the portal to finish its save/validation response.
+    page.wait_for_timeout(1200)
     after = 0.0
-    for _ in range(24):
-        page.wait_for_timeout(250)
+    for _ in range(28):
         try:
             after = todays_hours(page)
         except Exception:
-            continue
-        if after >= need:
+            after = 0.0
+        if after >= done + need - 0.01:
             break
-    if after >= need:
-        log(f"Saved OK - {after}h now logged for {TODAY}")
-    else:
-        log(f"WARNING: Save clicked but only {after}h shows for {TODAY}. Please verify the entry.")
+        page.wait_for_timeout(300)
+
+    visible_text = body_text(page)
+    validation_phrases = (
+        "please enter a different description",
+        "actual hours cannot be entered next day",
+        "please enter timesheet every day",
+        "the actual hours field is required",
+        "validation error",
+    )
+    found_errors = [phrase for phrase in validation_phrases if phrase in visible_text]
+    if found_errors:
+        dump_form(page)
+        raise RuntimeError(
+            "Portal rejected the timesheet save: " + "; ".join(found_errors)
+            + ". No successful save will be reported."
+        )
+
+    expected_after = done + need
+    if after + 0.01 < expected_after:
+        dump_form(page)
+        raise RuntimeError(
+            f"Save could not be verified. Before save={done:g}h, "
+            f"expected after save={expected_after:g}h, portal shows={after:g}h. "
+            "The script stopped instead of reporting a successful save. "
+            "See form_debug.txt/png and verify the portal manually."
+        )
+
+    log(f"Save verified - {after:g}h now logged for {TODAY}")
     return "saved"
 
 
@@ -1229,9 +1218,6 @@ def process_project(page, project_code, project_name, ents):
         existing_descriptions = portal_existing_descriptions(page)
         task_entries = make_descriptions_unique(ents, existing_descriptions)
         result = fill_current_task(page, task_entries)
-        if result == "dry":
-            input("Check the browser, then press Enter to continue... ")
-            return
         if result in ("saved", "done", "partial"):
             REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
                                         result=result, entries=task_entries))
@@ -1366,20 +1352,22 @@ def main():
             )
         entries = read_entries(source)
 
-        # First combine all source tasks belonging to the same project and
-        # discipline into one portal description and one summed hour total.
-        source_total = sum(float(e["hours"]) for e in entries)
-        combined_entries = combine_project_tasks(entries)
+        # Preserve every source task as its own portal entry.
+        # Never combine tasks by project or discipline.
+        source_total = round(sum(float(e["hours"]) for e in entries), 2)
 
-        # Portal rule: maximum 5 hours per individual time-log row. If a
-        # combined project total exceeds 5h, split that combined entry into
-        # multiple rows, preserving the same combined description and total.
-        entries = split_long_task_entries(combined_entries)
-        total = sum(float(e["hours"]) for e in entries)
+        # Resolve duplicates across the COMPLETE import batch, including
+        # repeated descriptions in different projects, without merging rows.
+        entries = make_descriptions_unique(entries)
 
-        if round(source_total, 2) != round(total, 2):
+        # Portal limit: split only an individual source task that exceeds
+        # five hours. Every other source task remains exactly one row.
+        entries = split_long_task_entries(entries)
+        total = round(sum(float(e["hours"]) for e in entries), 2)
+
+        if source_total != total:
             raise ValueError(
-                f"Hours changed during project combining/splitting: "
+                f"Hours changed during task preparation: "
                 f"source={source_total:g}h, prepared={total:g}h"
             )
 
@@ -1447,15 +1435,14 @@ def main():
             for project_code, project_data in groups.items():
                 process_project(page, project_code, project_data["name"], project_data["entries"])
 
-            if MODE != "dry":
-                REPORT["tracking"] = check_tracking(page, expected)
-                t = REPORT["tracking"]
-                log(f"Tracking page: {t['status']} | {t['row']} {t['note']}")
-                subject, body = build_report_email(expected, label)
-                send_email(subject, body, REPORT["shots"])
+            REPORT["tracking"] = check_tracking(page, expected)
+            t = REPORT["tracking"]
+            log(f"Tracking page: {t['status']} | {t['row']} {t['note']}")
+            subject, body = build_report_email(expected, label)
+            send_email(subject, body, REPORT["shots"])
 
             log(f"FINISHED in {time.time() - T0:.1f} seconds")
-            if MODE not in ("hide", "dry"):
+            if MODE != "hide":
                 page.wait_for_timeout(END_PAUSE_MS)
         except Exception as ex:
             logging.error(f"FAILED: {ex}")
@@ -1463,7 +1450,7 @@ def main():
             REPORT["error"] = str(ex)
             # Do not attach task/error screenshots; only the single tracking
             # screenshot is included when the tracking page was reached.
-            if MODE not in ("dry", "track"):
+            if MODE != "track":
                 subject, body = build_report_email(expected, label)
                 send_email("[ATTENTION] Timesheet FAILED " + TODAY, body, REPORT["shots"])
             raise
