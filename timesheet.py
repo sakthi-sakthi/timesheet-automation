@@ -1199,44 +1199,71 @@ def fill_current_task(page, entries):
             "Stopped to prevent duplicate hours. Reconcile the portal entries manually."
         )
 
-    date_box = page.locator("#currentdate")
-    if date_box.count() == 0:
-        raise RuntimeError(
-            "Portal date control #currentdate was not found. "
-            "Stopped before entering actual hours."
-        )
+    # This portal does NOT expose a #currentdate control. The date is displayed
+    # in the first cell of the current editable time-log row (as shown in the
+    # supplied screenshot). Read it from that row instead of assuming an ID.
+    def _read_date_from_current_entry_row():
+        discipline_controls = page.locator("#discipline:visible")
+        if discipline_controls.count() == 0:
+            # A blank editable row may be present before its discipline selector
+            # becomes visible; inspect the final row containing the time fields.
+            candidate_rows = page.locator("tr").filter(
+                has=page.locator("#description:visible")
+            )
+            if candidate_rows.count() == 0:
+                return ""
+            row = candidate_rows.last
+        else:
+            row = discipline_controls.last.locator("xpath=ancestor::tr[1]")
 
-    date_control = date_box.first
-    date_type = (date_control.get_attribute("type") or "").lower()
-    expected_date_value = TODAY_D.strftime("%Y-%m-%d") if date_type == "date" else TODAY
-    current_date_value = date_control.input_value(timeout=3000).strip()
+        first_cell = row.locator("td").first
+        if first_cell.count() == 0:
+            return ""
 
-    # Log browser-side clock and portal date. Do not try to bypass the portal's
-    # server-side next-day restriction by selecting a different date.
+        return first_cell.evaluate("""cell => {
+            const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+            const controls = Array.from(cell.querySelectorAll('input, textarea, select'));
+            for (const el of controls) {
+                const value = norm(el.value || el.getAttribute('value'));
+                if (value) return value;
+            }
+            return norm(cell.innerText || cell.textContent);
+        }""")
+
     browser_clock = page.evaluate("""() => ({
         local: new Date().toString(),
         iso: new Date().toISOString(),
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
     })""")
+    portal_row_date = _read_date_from_current_entry_row()
     log(
-        f"Portal date preflight: field={current_date_value!r}, "
-        f"expected India date={expected_date_value!r}, browser={browser_clock}"
+        f"Portal date preflight: editable-row date={portal_row_date!r}, "
+        f"expected India date={TODAY!r}, browser={browser_clock}"
     )
 
-    if current_date_value != expected_date_value:
-        if date_control.is_disabled() or date_control.get_attribute("readonly") is not None:
-            raise RuntimeError(
-                f"Portal date is {current_date_value!r}, expected {expected_date_value!r}, "
-                "and the date field is disabled/read-only. Stopped without saving."
-            )
-        date_control.fill(expected_date_value, timeout=5000)
-        current_date_value = date_control.input_value(timeout=3000).strip()
+    def _parse_portal_date(value):
+        value = " ".join(str(value or "").split()).strip()
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d",
+                    "%d/%m/%y", "%d-%m-%y"):
+            try:
+                return datetime.datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+        return None
 
-    if current_date_value != expected_date_value:
+    parsed_portal_date = _parse_portal_date(portal_row_date)
+    if parsed_portal_date is None:
+        dump_form(page)
         raise RuntimeError(
-            f"Portal date verification failed: {current_date_value!r}; "
-            f"expected {expected_date_value!r}. Stopped without saving."
+            "Could not read the date from the current editable row's first cell. "
+            "Stopped before entering actual hours. Inspect form_debug.txt/png."
         )
+    if parsed_portal_date != TODAY_D:
+        raise RuntimeError(
+            f"Portal editable-row date is {parsed_portal_date.strftime('%d/%m/%Y')}, "
+            f"but today's India date is {TODAY}. Stopped before entering actual hours."
+        )
+    log(f"Portal editable-row date verified: {portal_row_date}")
 
     # If the portal is already displaying its next-day validation banner,
     # do not fill/save another batch and risk repeating the rejected submission.
