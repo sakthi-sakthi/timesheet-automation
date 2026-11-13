@@ -43,7 +43,7 @@ END_PAUSE_MS = 2000
 BLOCK_HEAVY = True
 T0 = time.time()
 
-REPORT = {"tasks": [], "shots": [], "tracking": None, "error": None}
+REPORT = {"tasks": [], "shots": [], "tracking": None, "error": None, "attempted": [], "verified_hours": 0.0}
 
 
 def log(msg):
@@ -679,7 +679,8 @@ def build_report_html():
 <table cellpadding="8" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:900px;margin-bottom:18px">
 <tr style="background:#eef2f7"><th align="left">Project</th><th align="right">Hours</th></tr>
 {project_rows}
-<tr style="background:#f4f6f8;font-weight:bold"><td>Total logged</td><td align="right">{total:g} hrs</td></tr>
+<tr style="background:#f4f6f8;font-weight:bold"><td>Confirmed task-entry hours</td><td align="right">{total:g} hrs</td></tr>
+<tr><td>Newly verified saved hours</td><td align="right">{REPORT.get("verified_hours", 0.0):g} hrs</td></tr>
 </table>
 <h3>Task-wise details</h3>
 <table cellpadding="7" cellspacing="0" border="1" style="border-collapse:collapse;width:100%;border-color:#d0d5dd">
@@ -859,16 +860,25 @@ def in_range(card):
 
 
 def todays_hours(page):
+    """Read the total hours shown in today's time-log history on this task page."""
     rows = safe_eval(page, ROWS_JS)
     total = 0.0
-    for r in rows:
-        if r.strip().startswith(TODAY):
-            for tok in r.split():
-                if len(tok) == 5 and tok[2] == ":" and tok.replace(":", "").isdigit():
-                    h, m = tok.split(":")
-                    total += int(h) + int(m) / 60
-                    break
-    return total
+    variants = {TODAY, TODAY_D.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{TODAY_D.day}/{TODAY_D.month}/{TODAY_D.year}",
+                TODAY_D.strftime("%d-%m-%Y"), TODAY_D.strftime("%Y-%m-%d")}
+    for raw in rows:
+        row = " ".join(str(raw).split())
+        # Match date anywhere in the row; some portal tables prepend a serial number.
+        if not any(v.lower() in row.lower() for v in variants):
+            continue
+        # The history table can show scheduled and actual time in the same row.
+        # Count only the first time value per dated history row to avoid doubling it.
+        match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", row)
+        if match:
+            h, m = match.groups()
+            minutes = int(m)
+            if minutes < 60:
+                total += int(h) + minutes / 60
+    return round(total, 2)
 
 
 def _timesheet_field_counts(page):
@@ -883,25 +893,17 @@ def _timesheet_field_counts(page):
 
 
 def add_row(page):
-    """Add exactly one time-log row and wait until its controls are present.
-
-    The old implementation waited only 8 seconds for #discipline. On slower
-    responses, or when the button's normal click handler did not fire, it
-    failed without useful diagnostics. This version waits longer, checks all
-    repeated form controls, and performs one JS-click fallback only after the
-    first click has clearly produced no new row.
-    """
+    """Add one row and wait until every repeated control has the same new count."""
     button = page.locator("#Addrows").first
-    if button.count() == 0:
-        raise RuntimeError("Add New Item button (#Addrows) was not found.")
-    if not button.is_visible():
-        raise RuntimeError("Add New Item button (#Addrows) is not visible.")
+    if button.count() == 0 or not button.is_visible():
+        raise RuntimeError("Add New Item button (#Addrows) was not found or is not visible.")
 
     before = _timesheet_field_counts(page)
+    expected = {key: value + 1 for key, value in before.items()}
 
-    def wait_for_new_row(timeout_ms):
+    def wait_for_complete_row(timeout_ms):
         page.wait_for_function(
-            """before => {
+            """expected => {
                 const now = {
                     discipline: document.querySelectorAll('#discipline').length,
                     description: document.querySelectorAll('#description').length,
@@ -909,43 +911,43 @@ def add_row(page):
                     actual: document.querySelectorAll('#actualHours').length,
                     status: document.querySelectorAll('#status').length
                 };
-                return Object.keys(now).some(key => now[key] > (before[key] || 0));
+                return Object.keys(expected).every(key => now[key] >= expected[key]) &&
+                       Object.keys(now).every(key => now[key] === now.discipline);
             }""",
-            arg=before,
-            timeout=timeout_ms
+            arg=expected, timeout=timeout_ms
         )
 
-    # First use a real browser click so normal mouse and application events fire.
     button.scroll_into_view_if_needed(timeout=5000)
     button.click(timeout=10000)
     try:
-        wait_for_new_row(12000)
+        wait_for_complete_row(15000)
     except Exception:
-        # The first click did not add any repeated controls. Try the element's
-        # native click handler once; do not keep clicking (that could add extras).
         current = _timesheet_field_counts(page)
-        if any(current[k] > before[k] for k in before):
-            log("New row controls appeared after the initial click.")
-            return
+        # Retry only when no field count changed at all; partial DOM cloning is unsafe.
+        if any(current[k] != before[k] for k in before):
+            dump_form(page)
+            raise RuntimeError(f"Incomplete new row controls. Before={before}; after={current}.")
         page.locator("#Addrows").first.evaluate("el => el.click()")
         try:
-            wait_for_new_row(10000)
+            wait_for_complete_row(15000)
         except Exception as ex:
             after = _timesheet_field_counts(page)
             dump_form(page)
-            raise RuntimeError(
-                "Could not add a new time-log row. "
-                f"Field counts before={before}, after={after}. "
-                "Debug files form_debug.txt and form_debug.png were saved. "
-                "Please verify the Add New Item button and page response."
-            ) from ex
+            raise RuntimeError(f"Could not add a complete time-log row. Before={before}; after={after}.") from ex
 
     after = _timesheet_field_counts(page)
-    log(f"New time-log row added. Field counts: {after}")
+    if len(set(after.values())) != 1 or after["discipline"] != before["discipline"] + 1:
+        dump_form(page)
+        raise RuntimeError(f"Time-log row controls are inconsistent: {after}")
+    log(f"Complete new time-log row added. Field counts: {after}")
 
 
 def fill_current_task(page, entries):
-    """Returns: saved | done | no_add | dry"""
+    """Fill every entry for one project task, save, and wait for verified persistence.
+
+    Returns: saved | done | no_add | partial | dry. A failed save raises and
+    stops the run so the next project is never opened prematurely.
+    """
     try:
         page.wait_for_selector("#SaveTimelog", timeout=15000)
     except Exception:
@@ -960,103 +962,136 @@ def fill_current_task(page, entries):
         log("No 'Add New Item' button on this task - trying next task")
         return "no_add"
 
-    # Let the history table load so we never save a duplicate entry
     try:
-        page.wait_for_load_state("networkidle", timeout=2500)
+        page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
         pass
 
-    need = sum(float(e["hours"]) for e in entries)
-    done = todays_hours(page)
-    if done >= need:
-        log(f"Already {done:g}h logged for {TODAY} on this task - nothing to do")
+    need = round(sum(float(e["hours"]) for e in entries), 2)
+    baseline = todays_hours(page)
+    if baseline >= need:
+        log(f"Already {baseline:g}h logged for {TODAY} on this task; expected {need:g}h. No duplicate entry added.")
         return "done"
-    if done > 0:
-        # The current history parser can verify the total, but cannot reliably
-        # map each saved history row back to each source description. Stop here
-        # rather than re-entering all entries and creating duplicate hours.
-        log(
-            f"PARTIAL ENTRY DETECTED: {done:g}h already logged, while this run "
-            f"expects {need:g}h. Skipping this task to prevent duplicate entries; "
-            "please compare the portal rows with Daily Tasks manually."
+    if baseline > 0:
+        raise RuntimeError(
+            f"Partial existing entries detected on task: {baseline:g}h present, {need:g}h expected. "
+            "Stopped to prevent duplicate hours. Reconcile the portal entries manually."
         )
-        return "partial"
 
     date_box = page.locator("#currentdate")
     if date_box.count() > 0:
-        try:
-            cur = date_box.first.input_value(timeout=3000)
-            if cur != TODAY:
-                log(f"Form date is {cur}, setting {TODAY}")
-                date_box.first.fill(TODAY, timeout=3000)
-        except Exception:
-            pass
+        cur = date_box.first.input_value(timeout=3000)
+        if cur != TODAY:
+            date_box.first.fill(TODAY, timeout=5000)
 
     try:
         for i, e in enumerate(entries):
             if i > 0 or page.locator("#discipline").count() == 0:
                 add_row(page)
+
+            counts = _timesheet_field_counts(page)
+            if len(set(counts.values())) != 1 or counts["discipline"] <= i:
+                raise RuntimeError(f"Form row controls are not aligned before filling entry {i + 1}: {counts}")
+
             page.evaluate(PICK_JS, ["#discipline", e["discipline"]])
-            page.locator("#description").last.fill(e["desc"])
+            page.locator("#description").nth(i).fill(e["desc"])
             portal_time = hours_to_portal_time(e["hours"])
-            page.locator("#scduledHours").last.fill(portal_time)
-            page.locator("#actualHours").last.fill(portal_time)
+            page.locator("#scduledHours").nth(i).fill(portal_time)
+            page.locator("#actualHours").nth(i).fill(portal_time)
             page.evaluate(PICK_JS, ["#status", e["status"]])
-            log(
-                f"Filled: {e['discipline']} | {e['desc']} | "
-                f"{e['hours']}h => {portal_time} | {e['status']}"
-            )
+            log(f"Filled entry {i + 1}/{len(entries)}: {e['desc']} | {e['hours']}h => {portal_time}")
+
+        # Final pre-save validation: all rows exist and each required field is populated.
+        form_check = page.evaluate("""() => {
+            const ids = ['discipline','description','scduledHours','actualHours','status'];
+            const counts = Object.fromEntries(ids.map(id => [id, document.querySelectorAll('#'+id).length]));
+            const n = counts.discipline;
+            const values = ids.map(id => Array.from(document.querySelectorAll('#'+id)).slice(0,n).map(el =>
+                (el.value || el.innerText || '').trim()));
+            return {counts, complete: Object.values(counts).every(v => v === n) &&
+                values.every(list => list.length === n && list.every(v => v !== ''))};
+        }""")
+        if not form_check.get("complete") or form_check["counts"]["discipline"] < len(entries):
+            dump_form(page)
+            raise RuntimeError(f"Pre-save form validation failed: {form_check}")
     except Exception:
         dump_form(page)
         raise
 
     if MODE == "dry":
-        log("DRY mode - Save NOT clicked")
+        log("DRY mode - all project entries filled; Save NOT clicked")
         return "dry"
 
-    page.click("#SaveTimelog")
-    after = 0.0
-    for _ in range(24):
-        page.wait_for_timeout(250)
+    log(f"Saving project task with {len(entries)} entries ({need:g}h total). Waiting for portal confirmation...")
+    page.locator("#SaveTimelog").click(timeout=15000)
+
+    # Wait up to 90 seconds for the server-side save/history table to reflect all hours.
+    # Require two consecutive matching reads to avoid accepting a transient UI update.
+    deadline = time.time() + 90
+    consecutive = 0
+    last_seen = baseline
+    while time.time() < deadline:
+        page.wait_for_timeout(1000)
         try:
-            after = todays_hours(page)
+            last_seen = todays_hours(page)
+            if last_seen >= round(baseline + need, 2):
+                consecutive += 1
+                if consecutive >= 3:
+                    log(f"PROJECT SAVE VERIFIED: {last_seen:g}h visible for {TODAY}; next project may start.")
+                    REPORT["verified_hours"] += need
+                    return "saved"
+            else:
+                consecutive = 0
+        except Exception as ex:
+            log(f"Waiting for saved history to load: {ex}")
+        # A server-side validation message should fail promptly, not wait the full timeout.
+        try:
+            alert_text = page.locator(".alert-danger, .text-danger, .validation-summary-errors").all_inner_texts()
+            errors = [x.strip() for x in alert_text if x.strip()]
+            if errors:
+                raise RuntimeError("Portal validation error after save: " + " | ".join(errors)[:1000])
+        except RuntimeError:
+            raise
         except Exception:
-            continue
-        if after >= need:
-            break
-    if after >= need:
-        log(f"Saved OK - {after}h now logged for {TODAY}")
-    else:
-        log(f"WARNING: Save clicked but only {after}h shows for {TODAY}. Please verify the entry.")
-    return "saved"
+            pass
+
+    dump_form(page)
+    raise RuntimeError(
+        f"SAVE NOT VERIFIED for this project task. Expected {need:g}h additional; "
+        f"history shows {last_seen:g}h (baseline {baseline:g}h). "
+        "Stopped before opening the next project to prevent misleading success or duplicate entries."
+    )
 
 
 def process_project(page, project_code, project_name, ents):
+    """Process one project as a unit; do not return until its save is verified."""
     open_board(page, project_code, project_name)
     cards = safe_eval(page, CARDS_JS)
-    log(f"{len(cards)} task card(s) found")
-    for c in cards:
-        log(f"  {c['title']} | {c['start']} - {c['end']}")
-
+    log(f"Project {project_name} [{project_code}]: {len(cards)} task card(s) found")
     todays = [c for c in cards if in_range(c)]
     if not todays:
-        log(f"No task covers {TODAY} for {project_name} [{project_code}] - nothing entered")
-        return
+        raise RuntimeError(f"No task card covers {TODAY} for {project_name} [{project_code}]. Project not saved.")
 
     for idx, c in enumerate(todays):
         if idx > 0:
             open_board(page, project_code, project_name)
-        log(f"Opening task: {c['title']}")
+        log(f"Opening task for project {project_code}: {c['title']}")
         page.evaluate(CLICK_HREF_JS, c["href"])
         result = fill_current_task(page, ents)
         if result == "dry":
+            REPORT["attempted"].append({"project": f"{project_name} [{project_code}]", "hours": sum(float(e["hours"]) for e in ents), "result": "DRY - not saved"})
             input("Check the browser, then press Enter to continue... ")
-            return
-        if result in ("saved", "done", "partial"):
+            return "dry"
+        if result in ("saved", "done"):
             REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
-                                        result=result, entries=ents))
-            return
-    log(f"No matching task for {project_name} [{project_code}] had an Add New Item button")
+                                        result=("verified saved" if result == "saved" else "already present"), entries=ents))
+            log(f"PROJECT COMPLETE: {project_name} [{project_code}] - {result}. Proceeding to next project.")
+            return result
+        if result == "no_add":
+            continue
+        raise RuntimeError(f"Project {project_code} stopped with status: {result}")
+
+    raise RuntimeError(f"No eligible task page with Add New Item was found for {project_name} [{project_code}].")
 
 
 # ---------------------------------------------------------------- tracking page
