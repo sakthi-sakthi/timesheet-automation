@@ -1,7 +1,6 @@
 import os, re, sys, time, smtplib, datetime, logging
 from collections import OrderedDict
 from pathlib import Path
-from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 import csv, io, urllib.request, urllib.parse
 from dotenv import load_dotenv
@@ -23,9 +22,8 @@ MAIL_PASS = os.environ.get("MAIL_PASS", "")
 MAIL_TO = os.environ.get("MAIL_TO", "")
 
 BASE = "https://bsoftagile.boscosofttech.com/"
-IST = ZoneInfo('Asia/Kolkata')
-TODAY_D = datetime.datetime.now(IST).date()
-TODAY = TODAY_D.strftime('%d/%m/%Y')
+TODAY_D = datetime.date.today()
+TODAY = TODAY_D.strftime("%d/%m/%Y")
 
 # ---- Working-day rules -------------------------------------------------
 WEEKDAY_HOURS = 8            # Monday to Friday
@@ -991,7 +989,6 @@ def _description_key(value):
 
 
 def _technical_duplicate_qualifier(description, attempt=1):
-    """Return a meaningful technical activity qualifier, never '(2)'."""
     text = str(description or "").casefold()
     rules = [
         (("cpanel", "website", "web site", "site availability"),
@@ -1019,70 +1016,46 @@ def _technical_duplicate_qualifier(description, attempt=1):
          ["Document Rendering Validation", "Output Format Verification",
           "Document Data Integrity Review"]),
     ]
-    qualifiers = None
-    for keywords, options in rules:
-        if any(keyword in text for keyword in keywords):
-            qualifiers = options
-            break
-    if qualifiers is None:
-        qualifiers = [
-            "Functional Validation",
-            "Technical Configuration Review",
-            "Integration Verification",
-            "Performance and Error Review",
-        ]
-    return qualifiers[(attempt - 1) % len(qualifiers)]
+    options = next((items for keywords, items in rules if any(k in text for k in keywords)),
+                   ["Functional Validation", "Technical Configuration Review",
+                    "Integration Verification", "Performance and Error Review"])
+    return options[(attempt - 1) % len(options)]
 
 
 def portal_existing_descriptions(page):
-    """
-    Read saved descriptions from the task's historical Activity Description
-    column. The portal renders historical descriptions as input values.
-    Excludes the active editable row containing #discipline.
-    """
+    """Read historical Activity Description input values; exclude the active row."""
     page.wait_for_selector("#SaveTimelog", state="visible", timeout=15000)
     values = page.evaluate(r"""() => {
         const norm = s => String(s || '').replace(/\s+/g, ' ').trim();
         const found = new Set();
 
+        // The portal history grid uses repeated #description IDs.
+        for (const el of Array.from(document.querySelectorAll('input#description, textarea#description'))) {
+            const row = el.closest('tr');
+            if (row && row.querySelector('#discipline')) continue;
+            const value = norm(el.value || el.getAttribute('value') || el.innerText || el.textContent);
+            if (value) found.add(value);
+        }
+
+        // Also read text-based history cells under the Activity Description header.
         for (const table of Array.from(document.querySelectorAll('table'))) {
             const rows = Array.from(table.querySelectorAll('tr'));
-            let headerIndex = -1;
-            let columnIndex = -1;
-
-            for (let ri = 0; ri < rows.length; ri++) {
-                const cells = Array.from(rows[ri].querySelectorAll('th,td'));
-                const ci = cells.findIndex(cell =>
-                    /activity description|description/i.test(norm(cell.innerText || cell.textContent))
-                );
-                if (ci >= 0) {
-                    headerIndex = ri;
-                    columnIndex = ci;
-                    break;
-                }
+            let headerIndex = -1, columnIndex = -1;
+            for (let i = 0; i < rows.length; i++) {
+                const cells = Array.from(rows[i].querySelectorAll('th,td'));
+                const ci = cells.findIndex(c => /activity description|description/i.test(norm(c.innerText || c.textContent)));
+                if (ci >= 0) { headerIndex = i; columnIndex = ci; break; }
             }
             if (headerIndex < 0) continue;
-
             for (const row of rows.slice(headerIndex + 1)) {
                 if (row.querySelector('#discipline')) continue;
                 const cells = Array.from(row.querySelectorAll(':scope > td, :scope > th'));
                 if (columnIndex >= cells.length) continue;
                 const cell = cells[columnIndex];
                 const control = cell.querySelector('input,textarea');
-                const value = norm(
-                    (control && ('value' in control ? control.value : '')) ||
-                    cell.innerText || cell.textContent
-                );
+                const value = norm((control && control.value) || cell.innerText || cell.textContent);
                 if (value) found.add(value);
             }
-        }
-
-        // Fallback: historical description controls outside editable rows.
-        for (const el of Array.from(document.querySelectorAll('#description'))) {
-            const row = el.closest('tr');
-            if (row && row.querySelector('#discipline')) continue;
-            const value = norm(el.value || el.getAttribute('value') || el.innerText || el.textContent);
-            if (value) found.add(value);
         }
         return Array.from(found);
     }""")
@@ -1092,17 +1065,14 @@ def portal_existing_descriptions(page):
 
 
 def make_descriptions_unique(entries, reserved_descriptions=None):
-    """Uniquify imported descriptions against portal history and this batch."""
     reserved = {_description_key(v) for v in (reserved_descriptions or [])}
     seen = set()
-    output = []
-
+    result = []
     for entry in entries:
         item = dict(entry)
         original = " ".join(str(item.get("desc", "")).split()).strip()
         if not original:
-            raise ValueError("An imported task has an empty activity description.")
-
+            raise ValueError("An imported task has an empty description.")
         candidate = original
         attempt = 1
         while _description_key(candidate) in reserved or _description_key(candidate) in seen:
@@ -1110,15 +1080,12 @@ def make_descriptions_unique(entries, reserved_descriptions=None):
             attempt += 1
             if attempt > 30:
                 raise RuntimeError(f"Could not create a unique technical description for: {original}")
-
         if candidate != original:
             item["desc"] = candidate
             log(f"DUPLICATE DESCRIPTION UPDATED: '{original}' -> '{candidate}'")
-
         seen.add(_description_key(candidate))
-        output.append(item)
-
-    return output
+        result.append(item)
+    return result
 
 
 def fill_current_task(page, entries):
@@ -1159,33 +1126,33 @@ def fill_current_task(page, entries):
         )
         return "partial"
 
-    # The portal's date input is readonly and has the exact markup:
-    # <input id="currentdate" readonly value="DD/MM/YYYY" type="text">
-    # Read and validate it; never try to fill a readonly date field.
+    # The portal creates #currentdate together with the first editable row.
+    # Therefore add the first row BEFORE looking for the date control.
+    if page.locator("#discipline:visible").count() == 0:
+        add_row(page)
+
     date_box = page.locator("input#currentdate")
     if date_box.count() == 0:
         dump_form(page)
         raise RuntimeError(
-            "Portal date input input#currentdate was not found. "
-            "Stopped before entering actual hours. See form_debug.txt/png."
+            "Portal date input input#currentdate is still missing after the first "
+            "editable row was added. Stopped before entering actual hours. "
+            "See form_debug.txt/png."
         )
 
-    date_control = date_box.first
-    portal_date = date_control.input_value(timeout=5000).strip()
+    portal_date = date_box.first.input_value(timeout=5000).strip()
     log(f"Portal date control: value={portal_date!r}; expected India date={TODAY!r}")
-
     if portal_date != TODAY:
         dump_form(page)
         raise RuntimeError(
-            f"Portal date is {portal_date!r}, but India current date is {TODAY!r}. "
-            "The portal date is readonly, so the script will not change it. "
-            "Stopped before entering actual hours."
+            f"Portal readonly date is {portal_date!r}, but India current date is {TODAY!r}. "
+            "The script will not alter the readonly date. Stopped before entering actual hours."
         )
-    log(f"Portal date verified from #currentdate: {portal_date}")
+    log(f"Portal date verified: {portal_date}")
 
     try:
         for i, e in enumerate(entries):
-            if i > 0 or page.locator("#discipline").count() == 0:
+            if i > 0:
                 add_row(page)
             page.evaluate(PICK_JS, ["#discipline", e["discipline"]])
             page.locator("#description").last.fill(e["desc"])
@@ -1238,39 +1205,29 @@ def process_project(page, project_code, project_name, ents):
         if idx > 0:
             open_board(page, project_code, project_name)
         log(f"Opening task: {c['title']}")
-
-        # Use a Playwright click and wait for navigation. A direct DOM click
-        # can destroy the page execution context while the task page unloads.
-        task_link = page.locator("a[href]").filter(
-            has_text=re.compile(r".*")
-        )
-        matching_link = None
-        for link_index in range(task_link.count()):
-            candidate = task_link.nth(link_index)
+        # Use locator click and wait for navigation to finish before inspecting DOM.
+        task_link = None
+        links = page.locator("a[href]")
+        for link_index in range(links.count()):
+            candidate = links.nth(link_index)
             if candidate.get_attribute("href") == c["href"]:
-                matching_link = candidate
+                task_link = candidate
                 break
-        if matching_link is None:
-            raise RuntimeError(f"Could not find task link for {c['title']}: {c['href']}")
-
+        if task_link is None:
+            raise RuntimeError(f"Could not find task link: {c['href']}")
         try:
             with page.expect_navigation(wait_until="domcontentloaded", timeout=12000):
-                matching_link.click(timeout=10000)
+                task_link.click(timeout=10000)
         except Exception:
-            # AJAX-style navigation may not trigger a full navigation event.
             pass
-
         page.wait_for_selector("#SaveTimelog", state="visible", timeout=20000)
         try:
-            page.wait_for_load_state("networkidle", timeout=4000)
+            page.wait_for_load_state("networkidle", timeout=3500)
         except Exception:
             pass
 
-        # Compare with the task's existing history before entering new rows.
         existing_descriptions = portal_existing_descriptions(page)
-        task_entries = make_descriptions_unique(
-            ents, reserved_descriptions=existing_descriptions
-        )
+        task_entries = make_descriptions_unique(ents, existing_descriptions)
         result = fill_current_task(page, task_entries)
         if result == "dry":
             input("Check the browser, then press Enter to continue... ")
