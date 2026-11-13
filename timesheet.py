@@ -882,7 +882,7 @@ def todays_hours(page):
 
 
 def _timesheet_field_counts(page):
-    """Return counts for the repeated controls in the time-log form."""
+    """Diagnostic counts only; duplicate IDs exist in the history and entry form."""
     return page.evaluate("""() => ({
         discipline: document.querySelectorAll('#discipline').length,
         description: document.querySelectorAll('#description').length,
@@ -892,63 +892,69 @@ def _timesheet_field_counts(page):
     })""")
 
 
-def add_row(page):
-    """Add one row and wait until every required control gains one instance.
+def _current_entry_row(page):
+    """Return the actual editable time-log row, not historical description inputs."""
+    discipline = page.locator("#discipline:visible").last
+    if discipline.count() == 0:
+        raise RuntimeError("Editable Discipline selector is missing.")
+    row = discipline.locator("xpath=ancestor::tr[1]")
+    if row.count() == 0:
+        raise RuntimeError("Could not locate the editable time-log table row (ancestor tr).")
 
-    These selectors are not guaranteed to have equal baseline counts: for example,
-    #description may also match static/search fields outside the repeated row.
-    Therefore compare each selector with its own pre-click count rather than
-    requiring all selector counts to be identical.
-    """
+    required = ("#discipline", "#description", "#scduledHours", "#actualHours", "#status")
+    missing = [sel for sel in required if row.locator(sel).count() != 1]
+    if missing:
+        raise RuntimeError(
+            "Editable time-log row does not contain exactly one of each required control. "
+            f"Missing/duplicate controls: {missing}; row HTML: {row.evaluate('(el) => el.outerHTML')[:2500]}"
+        )
+    return row
+
+
+def add_row(page):
+    """Add exactly one editable time-log row and wait for its row-scoped controls."""
     button = page.locator("#Addrows").first
     if button.count() == 0 or not button.is_visible():
         raise RuntimeError("Add New Item button (#Addrows) was not found or is not visible.")
 
     before = _timesheet_field_counts(page)
-    expected = {key: value + 1 for key, value in before.items()}
-
-    def wait_for_complete_row(timeout_ms):
-        page.wait_for_function(
-            """expected => {
-                const now = {
-                    discipline: document.querySelectorAll('#discipline').length,
-                    description: document.querySelectorAll('#description').length,
-                    scheduled: document.querySelectorAll('#scduledHours').length,
-                    actual: document.querySelectorAll('#actualHours').length,
-                    status: document.querySelectorAll('#status').length
-                };
-                return Object.keys(expected).every(key => now[key] >= expected[key]);
-            }""",
-            arg=expected, timeout=timeout_ms
-        )
-
+    before_discipline = page.locator("#discipline:visible").count()
     button.scroll_into_view_if_needed(timeout=5000)
     button.click(timeout=10000)
-    try:
-        wait_for_complete_row(15000)
-    except Exception:
-        current = _timesheet_field_counts(page)
-        # Retry only when no field count changed at all; partial DOM cloning is unsafe.
-        if any(current[k] != before[k] for k in before):
-            dump_form(page)
-            raise RuntimeError(f"Incomplete new row controls. Before={before}; after={current}.")
-        page.locator("#Addrows").first.evaluate("el => el.click()")
-        try:
-            wait_for_complete_row(15000)
-        except Exception as ex:
-            after = _timesheet_field_counts(page)
-            dump_form(page)
-            raise RuntimeError(f"Could not add a complete time-log row. Before={before}; after={after}.") from ex
 
-    after = _timesheet_field_counts(page)
-    missing = [key for key in before if after[key] < before[key] + 1]
-    if missing:
+    try:
+        page.wait_for_function(
+            """before => document.querySelectorAll('#discipline').length > before""",
+            arg=before["discipline"], timeout=15000
+        )
+    except Exception as ex:
         dump_form(page)
         raise RuntimeError(
-            f"New row is missing required controls {missing}. "
-            f"Before={before}; after={after}."
-        )
-    log(f"Complete new time-log row added. Field counts: {after}")
+            f"Add New Item did not create a new Discipline control. "
+            f"Before={before}; after={_timesheet_field_counts(page)}"
+        ) from ex
+
+    # Wait until the newly-created final discipline's own table row has all controls.
+    try:
+        page.wait_for_function("""() => {
+            const ds = Array.from(document.querySelectorAll('#discipline')).filter(
+                e => e.offsetParent !== null
+            );
+            if (!ds.length) return false;
+            const row = ds[ds.length - 1].closest('tr');
+            if (!row) return false;
+            return ['discipline','description','scduledHours','actualHours','status']
+                .every(id => row.querySelectorAll('#' + id).length === 1);
+        }""", timeout=15000)
+        _current_entry_row(page)
+    except Exception as ex:
+        dump_form(page)
+        raise RuntimeError(
+            f"New editable row did not become complete. "
+            f"Before={before}; after={_timesheet_field_counts(page)}"
+        ) from ex
+
+    log(f"New editable row added. Global counts (diagnostic only): {_timesheet_field_counts(page)}")
 
 
 def fill_current_task(page, entries):
@@ -995,34 +1001,52 @@ def fill_current_task(page, entries):
 
     try:
         for i, e in enumerate(entries):
-            if i > 0 or page.locator("#discipline").count() == 0:
+            # The portal initially renders one blank editable row. Reuse it for
+            # entry 1; create one additional row for every subsequent entry.
+            if i > 0:
                 add_row(page)
 
-            counts = _timesheet_field_counts(page)
-            if len(set(counts.values())) != 1 or counts["discipline"] <= i:
-                raise RuntimeError(f"Form row controls are not aligned before filling entry {i + 1}: {counts}")
+            row = _current_entry_row(page)
+            discipline = row.locator("#discipline")
+            description = row.locator("#description")
+            scheduled = row.locator("#scduledHours")
+            actual = row.locator("#actualHours")
+            status = row.locator("#status")
 
-            page.evaluate(PICK_JS, ["#discipline", e["discipline"]])
-            page.locator("#description").nth(i).fill(e["desc"])
+            # Select options within this exact row; never use a global duplicate-ID selector.
+            discipline.select_option(label=e["discipline"], timeout=8000)
+            description.fill(e["desc"])
             portal_time = hours_to_portal_time(e["hours"])
-            page.locator("#scduledHours").nth(i).fill(portal_time)
-            page.locator("#actualHours").nth(i).fill(portal_time)
-            page.evaluate(PICK_JS, ["#status", e["status"]])
+            scheduled.fill(portal_time)
+            actual.fill(portal_time)
+            status.select_option(label=e["status"], timeout=8000)
             log(f"Filled entry {i + 1}/{len(entries)}: {e['desc']} | {e['hours']}h => {portal_time}")
 
-        # Final pre-save validation: all rows exist and each required field is populated.
-        form_check = page.evaluate("""() => {
-            const ids = ['discipline','description','scduledHours','actualHours','status'];
-            const counts = Object.fromEntries(ids.map(id => [id, document.querySelectorAll('#'+id).length]));
-            const n = counts.discipline;
-            const values = ids.map(id => Array.from(document.querySelectorAll('#'+id)).slice(0,n).map(el =>
-                (el.value || el.innerText || '').trim()));
-            return {counts, complete: Object.values(counts).every(v => v === n) &&
-                values.every(list => list.length === n && list.every(v => v !== ''))};
-        }""")
-        if not form_check.get("complete") or form_check["counts"]["discipline"] < len(entries):
+        # Validate the actual editable rows, excluding historical log rows.
+        form_check = page.evaluate("""expectedRows => {
+            const ds = Array.from(document.querySelectorAll('#discipline')).filter(
+                e => e.offsetParent !== null
+            );
+            const rows = ds.map(d => d.closest('tr'));
+            const result = rows.map((row, index) => {
+                if (!row) return {index, error:'no table row'};
+                const get = id => row.querySelector('#' + id);
+                const ids = ['discipline','description','scduledHours','actualHours','status'];
+                const controls = Object.fromEntries(ids.map(id => [id, get(id)]));
+                const values = Object.fromEntries(ids.map(id => {
+                    const el = controls[id];
+                    return [id, el ? String(el.value || el.innerText || '').trim() : ''];
+                }));
+                return {index, values, complete: ids.every(id => controls[id] && values[id] !== '')};
+            });
+            return {expectedRows, actualRows: rows.length, complete:
+                rows.length >= expectedRows && rows.slice(-expectedRows).every(r => r && 
+                    ['discipline','description','scduledHours','actualHours','status']
+                    .every(id => r.querySelector('#'+id) && String(r.querySelector('#'+id).value || '').trim() !== ''))};
+        }""", len(entries))
+        if not form_check.get("complete"):
             dump_form(page)
-            raise RuntimeError(f"Pre-save form validation failed: {form_check}")
+            raise RuntimeError(f"Pre-save editable-row validation failed: {form_check}")
     except Exception:
         dump_form(page)
         raise
