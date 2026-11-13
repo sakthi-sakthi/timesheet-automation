@@ -1001,9 +1001,12 @@ def fill_current_task(page, entries):
 
     try:
         for i, e in enumerate(entries):
-            # The portal initially renders one blank editable row. Reuse it for
-            # entry 1; create one additional row for every subsequent entry.
-            if i > 0:
+            # The portal may render NO editable row initially (only the
+            # historical time-log table and the Add New Item button). Reuse an
+            # existing blank editable row when present; otherwise create the
+            # first row before filling entry 1. For later entries, add one row.
+            visible_discipline_count = page.locator("#discipline:visible").count()
+            if i > 0 or visible_discipline_count == 0:
                 add_row(page)
 
             row = _current_entry_row(page)
