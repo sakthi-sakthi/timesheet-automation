@@ -22,8 +22,11 @@ MAIL_PASS = os.environ.get("MAIL_PASS", "")
 MAIL_TO = os.environ.get("MAIL_TO", "")
 
 BASE = "https://bsoftagile.boscosofttech.com/"
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-TODAY_D = datetime.datetime.now(IST).date()
+# Keep the original runner/system date behavior used by the previously working
+# automation. Do not force an IST date here: the portal validates actual-hours
+# entry against its own server date, and a forced timezone can move the date
+# ahead of the portal backend near the UTC/IST day boundary.
+TODAY_D = datetime.date.today()
 TODAY = TODAY_D.strftime("%d/%m/%Y")
 
 # ---- Working-day rules -------------------------------------------------
@@ -1107,7 +1110,7 @@ def fill_current_task(page, entries):
         )
 
     portal_date = date_box.first.input_value(timeout=5000).strip()
-    log(f"Portal date control: value={portal_date!r}; expected India date={TODAY!r}")
+    log(f"Portal date control: value={portal_date!r}; expected runner date={TODAY!r}")
     if portal_date != TODAY:
         dump_form(page)
         raise RuntimeError(
