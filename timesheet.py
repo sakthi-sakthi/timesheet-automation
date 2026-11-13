@@ -1,6 +1,7 @@
 import os, re, sys, time, smtplib, datetime, logging
 from collections import OrderedDict
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 import csv, io, urllib.request, urllib.parse
 from dotenv import load_dotenv
@@ -22,7 +23,9 @@ MAIL_PASS = os.environ.get("MAIL_PASS", "")
 MAIL_TO = os.environ.get("MAIL_TO", "")
 
 BASE = "https://bsoftagile.boscosofttech.com/"
-TODAY_D = datetime.date.today()
+IST = ZoneInfo("Asia/Kolkata")
+NOW_IST = datetime.datetime.now(IST)
+TODAY_D = NOW_IST.date()
 TODAY = TODAY_D.strftime("%d/%m/%Y")
 
 # ---- Working-day rules -------------------------------------------------
@@ -253,6 +256,212 @@ def read_xlsx_bytes(raw):
             entries.append(item)
     wb.close()
     return entries
+
+
+
+def _technical_duplicate_suffix(description, occurrence):
+    """
+    Choose a meaningful technical qualifier for a repeated task description.
+    The qualifier describes the likely operational activity instead of adding
+    artificial counters such as '(2)'.
+    """
+    text = description.casefold()
+
+    # Operational monitoring tasks commonly entered in daily timesheets.
+    if any(word in text for word in ("cpanel", "website", "web site", "site", "url", "http", "uptime", "availability")):
+        options = [
+            "HTTP Availability Validation",
+            "Response-Time Diagnostics",
+            "SSL and Endpoint Verification",
+            "Web Service Health Check",
+            "Error Log Analysis",
+        ]
+    elif any(word in text for word in ("mysql", "database", "db", "query", "sql")):
+        options = [
+            "Database Performance Analysis",
+            "Query Load Diagnostics",
+            "Connection Utilization Review",
+            "Slow Query Inspection",
+            "Database Resource Audit",
+        ]
+    elif any(word in text for word in ("server", "cpu", "memory", "ram", "disk", "hosting", "resource")):
+        options = [
+            "Infrastructure Health Validation",
+            "Resource Utilization Analysis",
+            "Service Availability Diagnostics",
+            "System Log Inspection",
+            "Capacity and Performance Review",
+        ]
+    elif any(word in text for word in ("security", "vulnerability", "firewall", "malware", "sophos", "patch")):
+        options = [
+            "Security Configuration Audit",
+            "Threat and Event Analysis",
+            "Patch Compliance Validation",
+            "Access Control Review",
+            "Vulnerability Assessment",
+        ]
+    elif any(word in text for word in ("backup", "restore", "recovery")):
+        options = [
+            "Backup Integrity Validation",
+            "Recovery Readiness Check",
+            "Backup Log Analysis",
+            "Restore Verification",
+        ]
+    elif any(word in text for word in ("email", "smtp", "mail")):
+        options = [
+            "SMTP Connectivity Validation",
+            "Mail Queue Diagnostics",
+            "Delivery Log Analysis",
+            "Email Service Health Check",
+        ]
+    elif any(word in text for word in ("laravel", "php", "wordpress", "plugin", "deployment", "code", "application", "api")):
+        options = [
+            "Application Runtime Validation",
+            "Configuration and Log Analysis",
+            "Dependency Compatibility Review",
+            "API and Service Diagnostics",
+            "Deployment Verification",
+        ]
+    else:
+        options = [
+            "Technical Validation",
+            "Configuration Review",
+            "Performance Analysis",
+            "Service Diagnostics",
+            "Operational Audit",
+            "Log Analysis",
+            "Compatibility Verification",
+            "Resource Assessment",
+        ]
+
+    return options[(occurrence - 2) % len(options)]
+
+
+def _description_key(value):
+    """Normalize a description for case/whitespace-insensitive comparison."""
+    return " ".join(str(value or "").split()).strip().casefold()
+
+
+def make_descriptions_unique(entries, reserved_descriptions=None):
+    """
+    Ensure descriptions are unique against both the import batch and any
+    descriptions already found in the currently opened portal task history.
+
+    Repeated/conflicting descriptions get a meaningful technical qualifier,
+    never artificial '(2)' / '(3)' suffixes.
+    """
+    reserved = {
+        _description_key(value)
+        for value in (reserved_descriptions or [])
+        if _description_key(value)
+    }
+    seen = set()
+    result = []
+
+    for entry in entries:
+        item = dict(entry)
+        original = " ".join(str(item.get("desc", "")).split()).strip()
+        if not original:
+            raise ValueError("An imported task has an empty description.")
+
+        candidate = original
+        qualifier_index = 2
+
+        if _description_key(candidate) in seen or _description_key(candidate) in reserved:
+            while True:
+                qualifier = _technical_duplicate_suffix(original, qualifier_index)
+                candidate = f"{original} – {qualifier}"
+                key = _description_key(candidate)
+                if key not in seen and key not in reserved:
+                    break
+                qualifier_index += 1
+
+            item["desc"] = candidate
+            log(
+                "DUPLICATE DESCRIPTION AUTO-UPDATED: "
+                f"'{original}' -> '{candidate}'"
+            )
+
+        seen.add(_description_key(candidate))
+        result.append(item)
+
+    return result
+
+
+def portal_existing_descriptions(page):
+    """
+    Read descriptions already saved in the currently opened portal task page.
+
+    Preferred method: use the table's Description/Activity/Task column header.
+    Fallback: read non-visible historical #description controls, excluding
+    the visible editable form row. If the portal markup cannot be identified,
+    return an empty list and log a warning rather than guessing from unrelated
+    table columns.
+    """
+    try:
+        found = page.evaluate("""() => {
+            const values = new Set();
+            const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+
+            // Existing historical rows: identify the description column by
+            // its header text, then read that column from body rows.
+            for (const table of Array.from(document.querySelectorAll('table'))) {
+                const headerRows = Array.from(table.querySelectorAll('thead tr'));
+                const allRows = Array.from(table.querySelectorAll('tr'));
+                let header = headerRows.length ? headerRows[headerRows.length - 1] : null;
+
+                if (!header) {
+                    header = allRows.find(row =>
+                        Array.from(row.querySelectorAll('th')).length > 0
+                    ) || null;
+                }
+                if (!header) continue;
+
+                const headers = Array.from(header.querySelectorAll('th, td'))
+                    .map(cell => norm(cell.innerText || cell.textContent).toLowerCase());
+                const index = headers.findIndex(text =>
+                    /description|activity|task name|task details/.test(text)
+                );
+                if (index < 0) continue;
+
+                for (const row of allRows) {
+                    if (row === header || row.querySelector('th')) continue;
+                    const cells = Array.from(row.querySelectorAll(':scope > td'));
+                    if (cells.length <= index) continue;
+                    const value = norm(cells[index].innerText || cells[index].textContent);
+                    if (value) values.add(value);
+                }
+            }
+
+            // Some portal versions render saved descriptions as disabled or
+            // read-only inputs instead of plain table cells.
+            for (const el of Array.from(document.querySelectorAll('#description'))) {
+                if (el.offsetParent !== null && !el.disabled && !el.readOnly) continue;
+                const value = norm(el.value || el.innerText || el.textContent);
+                if (value) values.add(value);
+            }
+
+            // Exclude obvious header labels accidentally collected as values.
+            return Array.from(values).filter(value =>
+                !/^(description|activity|task name|task details)$/i.test(value)
+            );
+        }""")
+        cleaned = [
+            " ".join(str(value).split()).strip()
+            for value in (found or [])
+            if " ".join(str(value).split()).strip()
+        ]
+        log(
+            f"Portal history duplicate check: {len(cleaned)} existing "
+            "description(s) found on this task page."
+        )
+        return cleaned
+    except Exception as ex:
+        log(
+            "WARNING: Could not read existing portal descriptions on this "
+            f"task page; only import-batch duplicate protection applies. Reason: {ex}"
+        )
+        return []
 
 
 def read_entries(source):
@@ -1135,14 +1344,22 @@ def process_project(page, project_code, project_name, ents):
             open_board(page, project_code, project_name)
         log(f"Opening task for project {project_code}: {c['title']}")
         page.evaluate(CLICK_HREF_JS, c["href"])
-        result = fill_current_task(page, ents)
+
+        # Compare imported descriptions against saved descriptions visible in
+        # this portal task's history before filling any editable rows.
+        existing_portal_descriptions = portal_existing_descriptions(page)
+        task_entries = make_descriptions_unique(
+            ents,
+            reserved_descriptions=existing_portal_descriptions
+        )
+        result = fill_current_task(page, task_entries)
         if result == "dry":
             REPORT["attempted"].append({"project": f"{project_name} [{project_code}]", "hours": sum(float(e["hours"]) for e in ents), "result": "DRY - not saved"})
             input("Check the browser, then press Enter to continue... ")
             return "dry"
         if result in ("saved", "done"):
             REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
-                                        result=("verified saved" if result == "saved" else "already present"), entries=ents))
+                                        result=("verified saved" if result == "saved" else "already present"), entries=task_entries))
             log(f"PROJECT COMPLETE: {project_name} [{project_code}] - {result}. Proceeding to next project.")
             return result
         if result == "no_add":
@@ -1277,6 +1494,10 @@ def main():
                 "Set TASK_SOURCE_URL in .env to your public Excel/Google Sheets URL, "
                 f"or provide the local {path} file."
             )
+        log(
+            f"India-local date/time: {NOW_IST.strftime('%d-%m-%Y %H:%M:%S %Z')} "
+            f"| processing date only: {TODAY}"
+        )
         entries = read_entries(source)
 
         # Keep every source task as a separate portal task entry.
@@ -1284,6 +1505,11 @@ def main():
         # per-row limit. Decimal hours are converted to HH:MM at form fill time.
         source_total = sum(float(e["hours"]) for e in entries)
         entries = split_long_task_entries(entries)
+
+        # Portal requires unique descriptions. Resolve duplicates during import,
+        # before opening the portal, without changing source-sheet values.
+        entries = make_descriptions_unique(entries)
+
         total = sum(float(e["hours"]) for e in entries)
 
         if round(source_total, 2) != round(total, 2):
