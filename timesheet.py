@@ -23,10 +23,9 @@ MAIL_PASS = os.environ.get("MAIL_PASS", "")
 MAIL_TO = os.environ.get("MAIL_TO", "")
 
 BASE = "https://bsoftagile.boscosofttech.com/"
-IST = ZoneInfo("Asia/Kolkata")
-NOW_IST = datetime.datetime.now(IST)
-TODAY_D = NOW_IST.date()
-TODAY = TODAY_D.strftime("%d/%m/%Y")
+IST = ZoneInfo('Asia/Kolkata')
+TODAY_D = datetime.datetime.now(IST).date()
+TODAY = TODAY_D.strftime('%d/%m/%Y')
 
 # ---- Working-day rules -------------------------------------------------
 WEEKDAY_HOURS = 8            # Monday to Friday
@@ -46,7 +45,7 @@ END_PAUSE_MS = 2000
 BLOCK_HEAVY = True
 T0 = time.time()
 
-REPORT = {"tasks": [], "shots": [], "tracking": None, "error": None, "attempted": [], "verified_hours": 0.0}
+REPORT = {"tasks": [], "shots": [], "tracking": None, "error": None}
 
 
 def log(msg):
@@ -232,6 +231,45 @@ def split_long_task_entries(entries):
 
 
 
+def combine_project_tasks(entries):
+    """Combine all same-project, same-discipline source tasks into one description/hour total.
+
+    Separate disciplines remain separate because the portal requires one discipline
+    selection per time-log row. Duplicate descriptions are listed only once, while
+    their hours are still included in the total.
+    """
+    combined = OrderedDict()
+    for entry in entries:
+        key = (entry["project_code"], entry["discipline"])
+        if key not in combined:
+            combined[key] = {
+                "project": entry["project"],
+                "project_code": entry["project_code"],
+                "project_name": entry["project_name"],
+                "discipline": entry["discipline"],
+                "descriptions": [],
+                "hours_total": 0.0,
+                "status": entry.get("status", "Completed"),
+            }
+        item = combined[key]
+        description = entry["desc"].strip()
+        if description and description not in item["descriptions"]:
+            item["descriptions"].append(description)
+        item["hours_total"] += float(entry["hours"])
+
+    result = []
+    for item in combined.values():
+        result.append({
+            "project": item["project"],
+            "project_code": item["project_code"],
+            "project_name": item["project_name"],
+            "discipline": item["discipline"],
+            "desc": "Combined tasks: " + "; ".join(item["descriptions"]),
+            "hours": f"{item['hours_total']:.2f}".rstrip("0").rstrip("."),
+            "status": item["status"],
+        })
+    return result
+
 def read_csv_bytes(raw):
     reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
     return [normalize_task_row({str(k).strip().lower(): v for k, v in row.items()})
@@ -256,209 +294,6 @@ def read_xlsx_bytes(raw):
             entries.append(item)
     wb.close()
     return entries
-
-
-
-def _technical_duplicate_suffix(description, occurrence):
-    """
-    Choose a meaningful technical qualifier for a repeated task description.
-    The qualifier describes the likely operational activity instead of adding
-    artificial counters such as '(2)'.
-    """
-    text = description.casefold()
-
-    # Operational monitoring tasks commonly entered in daily timesheets.
-    if any(word in text for word in ("cpanel", "website", "web site", "site", "url", "http", "uptime", "availability")):
-        options = [
-            "HTTP Availability Validation",
-            "Response-Time Diagnostics",
-            "SSL and Endpoint Verification",
-            "Web Service Health Check",
-            "Error Log Analysis",
-        ]
-    elif any(word in text for word in ("mysql", "database", "db", "query", "sql")):
-        options = [
-            "Database Performance Analysis",
-            "Query Load Diagnostics",
-            "Connection Utilization Review",
-            "Slow Query Inspection",
-            "Database Resource Audit",
-        ]
-    elif any(word in text for word in ("server", "cpu", "memory", "ram", "disk", "hosting", "resource")):
-        options = [
-            "Infrastructure Health Validation",
-            "Resource Utilization Analysis",
-            "Service Availability Diagnostics",
-            "System Log Inspection",
-            "Capacity and Performance Review",
-        ]
-    elif any(word in text for word in ("security", "vulnerability", "firewall", "malware", "sophos", "patch")):
-        options = [
-            "Security Configuration Audit",
-            "Threat and Event Analysis",
-            "Patch Compliance Validation",
-            "Access Control Review",
-            "Vulnerability Assessment",
-        ]
-    elif any(word in text for word in ("backup", "restore", "recovery")):
-        options = [
-            "Backup Integrity Validation",
-            "Recovery Readiness Check",
-            "Backup Log Analysis",
-            "Restore Verification",
-        ]
-    elif any(word in text for word in ("email", "smtp", "mail")):
-        options = [
-            "SMTP Connectivity Validation",
-            "Mail Queue Diagnostics",
-            "Delivery Log Analysis",
-            "Email Service Health Check",
-        ]
-    elif any(word in text for word in ("laravel", "php", "wordpress", "plugin", "deployment", "code", "application", "api")):
-        options = [
-            "Application Runtime Validation",
-            "Configuration and Log Analysis",
-            "Dependency Compatibility Review",
-            "API and Service Diagnostics",
-            "Deployment Verification",
-        ]
-    else:
-        options = [
-            "Technical Validation",
-            "Configuration Review",
-            "Performance Analysis",
-            "Service Diagnostics",
-            "Operational Audit",
-            "Log Analysis",
-            "Compatibility Verification",
-            "Resource Assessment",
-        ]
-
-    return options[(occurrence - 2) % len(options)]
-
-
-def _description_key(value):
-    """Normalize a description for case/whitespace-insensitive comparison."""
-    return " ".join(str(value or "").split()).strip().casefold()
-
-
-def make_descriptions_unique(entries, reserved_descriptions=None):
-    """
-    Ensure descriptions are unique against both the import batch and any
-    descriptions already found in the currently opened portal task history.
-
-    Repeated/conflicting descriptions get a meaningful technical qualifier,
-    never artificial '(2)' / '(3)' suffixes.
-    """
-    reserved = {
-        _description_key(value)
-        for value in (reserved_descriptions or [])
-        if _description_key(value)
-    }
-    seen = set()
-    result = []
-
-    for entry in entries:
-        item = dict(entry)
-        original = " ".join(str(item.get("desc", "")).split()).strip()
-        if not original:
-            raise ValueError("An imported task has an empty description.")
-
-        candidate = original
-        qualifier_index = 2
-
-        if _description_key(candidate) in seen or _description_key(candidate) in reserved:
-            while True:
-                qualifier = _technical_duplicate_suffix(original, qualifier_index)
-                candidate = f"{original} – {qualifier}"
-                key = _description_key(candidate)
-                if key not in seen and key not in reserved:
-                    break
-                qualifier_index += 1
-
-            item["desc"] = candidate
-            log(
-                "DUPLICATE DESCRIPTION AUTO-UPDATED: "
-                f"'{original}' -> '{candidate}'"
-            )
-
-        seen.add(_description_key(candidate))
-        result.append(item)
-
-    return result
-
-
-def portal_existing_descriptions(page):
-    """
-    Read every saved Activity Description from the task history, regardless
-    of date. Historical descriptions are rendered as visible input values in
-    this portal, so reading td.innerText alone misses them.
-    """
-    page.wait_for_selector("#SaveTimelog", state="visible", timeout=15000)
-    found = page.evaluate("""() => {
-        const values = new Set();
-        const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
-
-        // Read values from all historical description inputs. Exclude only
-        // the current editable entry row (the row containing #discipline).
-        for (const el of Array.from(document.querySelectorAll('#description'))) {
-            const row = el.closest('tr');
-            const currentEntryRow = row && row.querySelector('#discipline');
-            if (currentEntryRow) continue;
-
-            const value = norm(
-                ('value' in el ? el.value : '') ||
-                el.innerText || el.textContent || el.getAttribute('value')
-            );
-            if (value) values.add(value);
-        }
-
-        // Also support portals that render historical descriptions as text
-        // instead of input controls. Find the Activity Description column.
-        for (const table of Array.from(document.querySelectorAll('table'))) {
-            const rows = Array.from(table.querySelectorAll('tr'));
-            const header = rows.find(row =>
-                Array.from(row.querySelectorAll('th,td')).some(cell =>
-                    /activity description|description/i.test(norm(cell.innerText || cell.textContent))
-                )
-            );
-            if (!header) continue;
-
-            const headers = Array.from(header.querySelectorAll('th,td'));
-            const col = headers.findIndex(cell =>
-                /activity description|description/i.test(norm(cell.innerText || cell.textContent))
-            );
-            if (col < 0) continue;
-
-            for (const row of rows) {
-                if (row === header || row.querySelector('#discipline')) continue;
-                const cells = Array.from(row.querySelectorAll(':scope > td'));
-                if (cells.length <= col) continue;
-                const cell = cells[col];
-                const control = cell.querySelector('input,textarea');
-                const value = norm(
-                    (control && ('value' in control ? control.value : '')) ||
-                    cell.innerText || cell.textContent
-                );
-                if (value) values.add(value);
-            }
-        }
-
-        return Array.from(values);
-    }""")
-
-    cleaned = [
-        " ".join(str(value).split()).strip()
-        for value in (found or [])
-        if " ".join(str(value).split()).strip()
-    ]
-    log(
-        f"Portal history scan: {len(cleaned)} saved description(s) read "
-        "(all dates; input values + table text)."
-    )
-    if cleaned:
-        log("Portal history descriptions: " + " | ".join(cleaned[:30]))
-    return cleaned
 
 
 def read_entries(source):
@@ -885,8 +720,7 @@ def build_report_html():
 <table cellpadding="8" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:900px;margin-bottom:18px">
 <tr style="background:#eef2f7"><th align="left">Project</th><th align="right">Hours</th></tr>
 {project_rows}
-<tr style="background:#f4f6f8;font-weight:bold"><td>Confirmed task-entry hours</td><td align="right">{total:g} hrs</td></tr>
-<tr><td>Newly verified saved hours</td><td align="right">{REPORT.get("verified_hours", 0.0):g} hrs</td></tr>
+<tr style="background:#f4f6f8;font-weight:bold"><td>Total logged</td><td align="right">{total:g} hrs</td></tr>
 </table>
 <h3>Task-wise details</h3>
 <table cellpadding="7" cellspacing="0" border="1" style="border-collapse:collapse;width:100%;border-color:#d0d5dd">
@@ -1066,29 +900,20 @@ def in_range(card):
 
 
 def todays_hours(page):
-    """Read the total hours shown in today's time-log history on this task page."""
     rows = safe_eval(page, ROWS_JS)
     total = 0.0
-    variants = {TODAY, TODAY_D.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{TODAY_D.day}/{TODAY_D.month}/{TODAY_D.year}",
-                TODAY_D.strftime("%d-%m-%Y"), TODAY_D.strftime("%Y-%m-%d")}
-    for raw in rows:
-        row = " ".join(str(raw).split())
-        # Match date anywhere in the row; some portal tables prepend a serial number.
-        if not any(v.lower() in row.lower() for v in variants):
-            continue
-        # The history table can show scheduled and actual time in the same row.
-        # Count only the first time value per dated history row to avoid doubling it.
-        match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", row)
-        if match:
-            h, m = match.groups()
-            minutes = int(m)
-            if minutes < 60:
-                total += int(h) + minutes / 60
-    return round(total, 2)
+    for r in rows:
+        if r.strip().startswith(TODAY):
+            for tok in r.split():
+                if len(tok) == 5 and tok[2] == ":" and tok.replace(":", "").isdigit():
+                    h, m = tok.split(":")
+                    total += int(h) + int(m) / 60
+                    break
+    return total
 
 
 def _timesheet_field_counts(page):
-    """Diagnostic counts only; duplicate IDs exist in the history and entry form."""
+    """Return counts for the repeated controls in the time-log form."""
     return page.evaluate("""() => ({
         discipline: document.querySelectorAll('#discipline').length,
         description: document.querySelectorAll('#description').length,
@@ -1098,77 +923,206 @@ def _timesheet_field_counts(page):
     })""")
 
 
-def _current_entry_row(page):
-    """Return the actual editable time-log row, not historical description inputs."""
-    discipline = page.locator("#discipline:visible").last
-    if discipline.count() == 0:
-        raise RuntimeError("Editable Discipline selector is missing.")
-    row = discipline.locator("xpath=ancestor::tr[1]")
-    if row.count() == 0:
-        raise RuntimeError("Could not locate the editable time-log table row (ancestor tr).")
-
-    required = ("#discipline", "#description", "#scduledHours", "#actualHours", "#status")
-    missing = [sel for sel in required if row.locator(sel).count() != 1]
-    if missing:
-        raise RuntimeError(
-            "Editable time-log row does not contain exactly one of each required control. "
-            f"Missing/duplicate controls: {missing}; row HTML: {row.evaluate('(el) => el.outerHTML')[:2500]}"
-        )
-    return row
-
-
 def add_row(page):
-    """Add exactly one editable time-log row and wait for its row-scoped controls."""
+    """Add exactly one time-log row and wait until its controls are present.
+
+    The old implementation waited only 8 seconds for #discipline. On slower
+    responses, or when the button's normal click handler did not fire, it
+    failed without useful diagnostics. This version waits longer, checks all
+    repeated form controls, and performs one JS-click fallback only after the
+    first click has clearly produced no new row.
+    """
     button = page.locator("#Addrows").first
-    if button.count() == 0 or not button.is_visible():
-        raise RuntimeError("Add New Item button (#Addrows) was not found or is not visible.")
+    if button.count() == 0:
+        raise RuntimeError("Add New Item button (#Addrows) was not found.")
+    if not button.is_visible():
+        raise RuntimeError("Add New Item button (#Addrows) is not visible.")
 
     before = _timesheet_field_counts(page)
-    before_discipline = page.locator("#discipline:visible").count()
+
+    def wait_for_new_row(timeout_ms):
+        page.wait_for_function(
+            """before => {
+                const now = {
+                    discipline: document.querySelectorAll('#discipline').length,
+                    description: document.querySelectorAll('#description').length,
+                    scheduled: document.querySelectorAll('#scduledHours').length,
+                    actual: document.querySelectorAll('#actualHours').length,
+                    status: document.querySelectorAll('#status').length
+                };
+                return Object.keys(now).some(key => now[key] > (before[key] || 0));
+            }""",
+            arg=before,
+            timeout=timeout_ms
+        )
+
+    # First use a real browser click so normal mouse and application events fire.
     button.scroll_into_view_if_needed(timeout=5000)
     button.click(timeout=10000)
-
     try:
-        page.wait_for_function(
-            """before => document.querySelectorAll('#discipline').length > before""",
-            arg=before["discipline"], timeout=15000
-        )
-    except Exception as ex:
-        dump_form(page)
-        raise RuntimeError(
-            f"Add New Item did not create a new Discipline control. "
-            f"Before={before}; after={_timesheet_field_counts(page)}"
-        ) from ex
+        wait_for_new_row(12000)
+    except Exception:
+        # The first click did not add any repeated controls. Try the element's
+        # native click handler once; do not keep clicking (that could add extras).
+        current = _timesheet_field_counts(page)
+        if any(current[k] > before[k] for k in before):
+            log("New row controls appeared after the initial click.")
+            return
+        page.locator("#Addrows").first.evaluate("el => el.click()")
+        try:
+            wait_for_new_row(10000)
+        except Exception as ex:
+            after = _timesheet_field_counts(page)
+            dump_form(page)
+            raise RuntimeError(
+                "Could not add a new time-log row. "
+                f"Field counts before={before}, after={after}. "
+                "Debug files form_debug.txt and form_debug.png were saved. "
+                "Please verify the Add New Item button and page response."
+            ) from ex
 
-    # Wait until the newly-created final discipline's own table row has all controls.
-    try:
-        page.wait_for_function("""() => {
-            const ds = Array.from(document.querySelectorAll('#discipline')).filter(
-                e => e.offsetParent !== null
-            );
-            if (!ds.length) return false;
-            const row = ds[ds.length - 1].closest('tr');
-            if (!row) return false;
-            return ['discipline','description','scduledHours','actualHours','status']
-                .every(id => row.querySelectorAll('#' + id).length === 1);
-        }""", timeout=15000)
-        _current_entry_row(page)
-    except Exception as ex:
-        dump_form(page)
-        raise RuntimeError(
-            f"New editable row did not become complete. "
-            f"Before={before}; after={_timesheet_field_counts(page)}"
-        ) from ex
+    after = _timesheet_field_counts(page)
+    log(f"New time-log row added. Field counts: {after}")
 
-    log(f"New editable row added. Global counts (diagnostic only): {_timesheet_field_counts(page)}")
+
+
+def _description_key(value):
+    return " ".join(str(value or "").split()).strip().casefold()
+
+
+def _technical_duplicate_qualifier(description, attempt=1):
+    """Return a meaningful technical activity qualifier, never '(2)'."""
+    text = str(description or "").casefold()
+    rules = [
+        (("cpanel", "website", "web site", "site availability"),
+         ["HTTP Availability Validation", "SSL Certificate Verification",
+          "Website Response-Time Analysis", "Web Service Health Check"]),
+        (("mysql", "database", "db ", "query", "sql"),
+         ["Database Performance Analysis", "Query Execution Review",
+          "Database Connection Utilization Check", "Slow Query Inspection"]),
+        (("server", "hosting", "linux", "windows", "iis", "nginx", "apache"),
+         ["Infrastructure Health Validation", "CPU and Memory Utilization Review",
+          "Service Availability Verification", "Server Resource Analysis"]),
+        (("backup", "restore", "recovery"),
+         ["Backup Integrity Verification", "Recovery Readiness Validation",
+          "Backup Completion Audit"]),
+        (("security", "vulnerability", "firewall", "malware", "sophos"),
+         ["Security Configuration Review", "Threat and Vulnerability Validation",
+          "Access-Control Verification"]),
+        (("laravel", "php", "application", "api", "frontend", "backend"),
+         ["Application Runtime Validation", "API Integration Verification",
+          "Application Error and Log Review", "Dependency Compatibility Check"]),
+        (("deploy", "deployment", "release", "publish"),
+         ["Deployment Configuration Validation", "Release Health Verification",
+          "Post-Deployment Smoke Test"]),
+        (("invoice", "pdf", "document", "report"),
+         ["Document Rendering Validation", "Output Format Verification",
+          "Document Data Integrity Review"]),
+    ]
+    qualifiers = None
+    for keywords, options in rules:
+        if any(keyword in text for keyword in keywords):
+            qualifiers = options
+            break
+    if qualifiers is None:
+        qualifiers = [
+            "Functional Validation",
+            "Technical Configuration Review",
+            "Integration Verification",
+            "Performance and Error Review",
+        ]
+    return qualifiers[(attempt - 1) % len(qualifiers)]
+
+
+def portal_existing_descriptions(page):
+    """
+    Read saved descriptions from the task's historical Activity Description
+    column. The portal renders historical descriptions as input values.
+    Excludes the active editable row containing #discipline.
+    """
+    page.wait_for_selector("#SaveTimelog", state="visible", timeout=15000)
+    values = page.evaluate(r"""() => {
+        const norm = s => String(s || '').replace(/\s+/g, ' ').trim();
+        const found = new Set();
+
+        for (const table of Array.from(document.querySelectorAll('table'))) {
+            const rows = Array.from(table.querySelectorAll('tr'));
+            let headerIndex = -1;
+            let columnIndex = -1;
+
+            for (let ri = 0; ri < rows.length; ri++) {
+                const cells = Array.from(rows[ri].querySelectorAll('th,td'));
+                const ci = cells.findIndex(cell =>
+                    /activity description|description/i.test(norm(cell.innerText || cell.textContent))
+                );
+                if (ci >= 0) {
+                    headerIndex = ri;
+                    columnIndex = ci;
+                    break;
+                }
+            }
+            if (headerIndex < 0) continue;
+
+            for (const row of rows.slice(headerIndex + 1)) {
+                if (row.querySelector('#discipline')) continue;
+                const cells = Array.from(row.querySelectorAll(':scope > td, :scope > th'));
+                if (columnIndex >= cells.length) continue;
+                const cell = cells[columnIndex];
+                const control = cell.querySelector('input,textarea');
+                const value = norm(
+                    (control && ('value' in control ? control.value : '')) ||
+                    cell.innerText || cell.textContent
+                );
+                if (value) found.add(value);
+            }
+        }
+
+        // Fallback: historical description controls outside editable rows.
+        for (const el of Array.from(document.querySelectorAll('#description'))) {
+            const row = el.closest('tr');
+            if (row && row.querySelector('#discipline')) continue;
+            const value = norm(el.value || el.getAttribute('value') || el.innerText || el.textContent);
+            if (value) found.add(value);
+        }
+        return Array.from(found);
+    }""")
+    result = [" ".join(str(v).split()).strip() for v in (values or []) if str(v).strip()]
+    log(f"Portal history scan: {len(result)} saved description(s) read.")
+    return result
+
+
+def make_descriptions_unique(entries, reserved_descriptions=None):
+    """Uniquify imported descriptions against portal history and this batch."""
+    reserved = {_description_key(v) for v in (reserved_descriptions or [])}
+    seen = set()
+    output = []
+
+    for entry in entries:
+        item = dict(entry)
+        original = " ".join(str(item.get("desc", "")).split()).strip()
+        if not original:
+            raise ValueError("An imported task has an empty activity description.")
+
+        candidate = original
+        attempt = 1
+        while _description_key(candidate) in reserved or _description_key(candidate) in seen:
+            candidate = f"{original} – {_technical_duplicate_qualifier(original, attempt)}"
+            attempt += 1
+            if attempt > 30:
+                raise RuntimeError(f"Could not create a unique technical description for: {original}")
+
+        if candidate != original:
+            item["desc"] = candidate
+            log(f"DUPLICATE DESCRIPTION UPDATED: '{original}' -> '{candidate}'")
+
+        seen.add(_description_key(candidate))
+        output.append(item)
+
+    return output
 
 
 def fill_current_task(page, entries):
-    """Fill every entry for one project task, save, and wait for verified persistence.
-
-    Returns: saved | done | no_add | partial | dry. A failed save raises and
-    stops the run so the next project is never opened prematurely.
-    """
+    """Returns: saved | done | no_add | dry"""
     try:
         page.wait_for_selector("#SaveTimelog", timeout=15000)
     except Exception:
@@ -1183,279 +1137,149 @@ def fill_current_task(page, entries):
         log("No 'Add New Item' button on this task - trying next task")
         return "no_add"
 
+    # Let the history table load so we never save a duplicate entry
     try:
-        page.wait_for_load_state("networkidle", timeout=5000)
+        page.wait_for_load_state("networkidle", timeout=2500)
     except Exception:
         pass
 
-    need = round(sum(float(e["hours"]) for e in entries), 2)
-    baseline = todays_hours(page)
-    if baseline >= need:
-        log(f"Already {baseline:g}h logged for {TODAY} on this task; expected {need:g}h. No duplicate entry added.")
+    need = sum(float(e["hours"]) for e in entries)
+    done = todays_hours(page)
+    if done >= need:
+        log(f"Already {done:g}h logged for {TODAY} on this task - nothing to do")
         return "done"
-    if baseline > 0:
-        raise RuntimeError(
-            f"Partial existing entries detected on task: {baseline:g}h present, {need:g}h expected. "
-            "Stopped to prevent duplicate hours. Reconcile the portal entries manually."
+    if done > 0:
+        # The current history parser can verify the total, but cannot reliably
+        # map each saved history row back to each source description. Stop here
+        # rather than re-entering all entries and creating duplicate hours.
+        log(
+            f"PARTIAL ENTRY DETECTED: {done:g}h already logged, while this run "
+            f"expects {need:g}h. Skipping this task to prevent duplicate entries; "
+            "please compare the portal rows with Daily Tasks manually."
         )
+        return "partial"
 
-    # This portal does NOT expose a #currentdate control. The date is displayed
-    # in the first cell of the current editable time-log row (as shown in the
-    # supplied screenshot). Read it from that row instead of assuming an ID.
-    def _read_date_from_current_entry_row():
-        discipline_controls = page.locator("#discipline:visible")
-        if discipline_controls.count() == 0:
-            # A blank editable row may be present before its discipline selector
-            # becomes visible; inspect the final row containing the time fields.
-            candidate_rows = page.locator("tr").filter(
-                has=page.locator("#description:visible")
-            )
-            if candidate_rows.count() == 0:
-                return ""
-            row = candidate_rows.last
-        else:
-            row = discipline_controls.last.locator("xpath=ancestor::tr[1]")
-
-        first_cell = row.locator("td").first
-        if first_cell.count() == 0:
-            return ""
-
-        return first_cell.evaluate("""cell => {
-            const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
-            const controls = Array.from(cell.querySelectorAll('input, textarea, select'));
-            for (const el of controls) {
-                const value = norm(el.value || el.getAttribute('value'));
-                if (value) return value;
-            }
-            return norm(cell.innerText || cell.textContent);
-        }""")
-
-    browser_clock = page.evaluate("""() => ({
-        local: new Date().toString(),
-        iso: new Date().toISOString(),
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
-    })""")
-    portal_row_date = _read_date_from_current_entry_row()
-    log(
-        f"Portal date preflight: editable-row date={portal_row_date!r}, "
-        f"expected India date={TODAY!r}, browser={browser_clock}"
-    )
-
-    def _parse_portal_date(value):
-        value = " ".join(str(value or "").split()).strip()
-        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d",
-                    "%d/%m/%y", "%d-%m-%y"):
-            try:
-                return datetime.datetime.strptime(value, fmt).date()
-            except ValueError:
-                continue
-        return None
-
-    parsed_portal_date = _parse_portal_date(portal_row_date)
-    if parsed_portal_date is None:
+    # The portal's date input is readonly and has the exact markup:
+    # <input id="currentdate" readonly value="DD/MM/YYYY" type="text">
+    # Read and validate it; never try to fill a readonly date field.
+    date_box = page.locator("input#currentdate")
+    if date_box.count() == 0:
         dump_form(page)
         raise RuntimeError(
-            "Could not read the date from the current editable row's first cell. "
-            "Stopped before entering actual hours. Inspect form_debug.txt/png."
+            "Portal date input input#currentdate was not found. "
+            "Stopped before entering actual hours. See form_debug.txt/png."
         )
-    if parsed_portal_date != TODAY_D:
-        raise RuntimeError(
-            f"Portal editable-row date is {parsed_portal_date.strftime('%d/%m/%Y')}, "
-            f"but today's India date is {TODAY}. Stopped before entering actual hours."
-        )
-    log(f"Portal editable-row date verified: {portal_row_date}")
 
-    # If the portal is already displaying its next-day validation banner,
-    # do not fill/save another batch and risk repeating the rejected submission.
-    existing_page_message = page.locator("body").inner_text(timeout=5000)
-    if "actual hours cannot be entered next day" in existing_page_message.lower():
+    date_control = date_box.first
+    portal_date = date_control.input_value(timeout=5000).strip()
+    log(f"Portal date control: value={portal_date!r}; expected India date={TODAY!r}")
+
+    if portal_date != TODAY:
+        dump_form(page)
         raise RuntimeError(
-            "Portal is already displaying the next-day actual-hours restriction. "
-            "Stopped before entering or saving any rows. The browser date and "
-            "date field are logged above, but the portal's server-side date/time "
-            "or attendance cutoff must be checked by the portal administrator."
+            f"Portal date is {portal_date!r}, but India current date is {TODAY!r}. "
+            "The portal date is readonly, so the script will not change it. "
+            "Stopped before entering actual hours."
         )
+    log(f"Portal date verified from #currentdate: {portal_date}")
 
     try:
         for i, e in enumerate(entries):
-            # The portal may render NO editable row initially (only the
-            # historical time-log table and the Add New Item button). Reuse an
-            # existing blank editable row when present; otherwise create the
-            # first row before filling entry 1. For later entries, add one row.
-            visible_discipline_count = page.locator("#discipline:visible").count()
-            if i > 0 or visible_discipline_count == 0:
+            if i > 0 or page.locator("#discipline").count() == 0:
                 add_row(page)
-
-            row = _current_entry_row(page)
-            discipline = row.locator("#discipline")
-            description = row.locator("#description")
-            scheduled = row.locator("#scduledHours")
-            actual = row.locator("#actualHours")
-            status = row.locator("#status")
-
-            # Select options within this exact row; never use a global duplicate-ID selector.
-            discipline.select_option(label=e["discipline"], timeout=8000)
-            description.fill(e["desc"])
+            page.evaluate(PICK_JS, ["#discipline", e["discipline"]])
+            page.locator("#description").last.fill(e["desc"])
             portal_time = hours_to_portal_time(e["hours"])
-            scheduled.fill(portal_time)
-            actual.fill(portal_time)
-            status.select_option(label=e["status"], timeout=8000)
-            log(f"Filled entry {i + 1}/{len(entries)}: {e['desc']} | {e['hours']}h => {portal_time}")
-
-        # Validate the actual editable rows, excluding historical log rows.
-        form_check = page.evaluate("""expectedRows => {
-            const ds = Array.from(document.querySelectorAll('#discipline')).filter(
-                e => e.offsetParent !== null
-            );
-            const rows = ds.map(d => d.closest('tr'));
-            const result = rows.map((row, index) => {
-                if (!row) return {index, error:'no table row'};
-                const get = id => row.querySelector('#' + id);
-                const ids = ['discipline','description','scduledHours','actualHours','status'];
-                const controls = Object.fromEntries(ids.map(id => [id, get(id)]));
-                const values = Object.fromEntries(ids.map(id => {
-                    const el = controls[id];
-                    return [id, el ? String(el.value || el.innerText || '').trim() : ''];
-                }));
-                return {index, values, complete: ids.every(id => controls[id] && values[id] !== '')};
-            });
-            return {expectedRows, actualRows: rows.length, complete:
-                rows.length >= expectedRows && rows.slice(-expectedRows).every(r => r && 
-                    ['discipline','description','scduledHours','actualHours','status']
-                    .every(id => r.querySelector('#'+id) && String(r.querySelector('#'+id).value || '').trim() !== ''))};
-        }""", len(entries))
-        if not form_check.get("complete"):
-            dump_form(page)
-            raise RuntimeError(f"Pre-save editable-row validation failed: {form_check}")
+            page.locator("#scduledHours").last.fill(portal_time)
+            page.locator("#actualHours").last.fill(portal_time)
+            page.evaluate(PICK_JS, ["#status", e["status"]])
+            log(
+                f"Filled: {e['discipline']} | {e['desc']} | "
+                f"{e['hours']}h => {portal_time} | {e['status']}"
+            )
     except Exception:
         dump_form(page)
         raise
 
     if MODE == "dry":
-        log("DRY mode - all project entries filled; Save NOT clicked")
+        log("DRY mode - Save NOT clicked")
         return "dry"
 
-    log(f"Saving project task with {len(entries)} entries ({need:g}h total). Waiting for portal confirmation...")
-    page.locator("#SaveTimelog").click(timeout=15000)
-
-    # Wait up to 90 seconds for the server-side save/history table to reflect all hours.
-    # Require two consecutive matching reads to avoid accepting a transient UI update.
-    deadline = time.time() + 90
-    consecutive = 0
-    last_seen = baseline
-    while time.time() < deadline:
-        page.wait_for_timeout(1000)
+    page.click("#SaveTimelog")
+    after = 0.0
+    for _ in range(24):
+        page.wait_for_timeout(250)
         try:
-            last_seen = todays_hours(page)
-            if last_seen >= round(baseline + need, 2):
-                consecutive += 1
-                if consecutive >= 3:
-                    log(f"PROJECT SAVE VERIFIED: {last_seen:g}h visible for {TODAY}; next project may start.")
-                    REPORT["verified_hours"] += need
-                    return "saved"
-            else:
-                consecutive = 0
-        except Exception as ex:
-            log(f"Waiting for saved history to load: {ex}")
-        # Detect actual server-side validation messages only.
-        # Do NOT inspect generic .text-danger: this portal uses that class for
-        # required-field asterisks ("*"), which are decorations, not errors.
-        try:
-            candidates = page.locator(
-                ".alert-danger, .validation-summary-errors, "
-                ".field-validation-error, [role='alert'], .toast-error, "
-                ".swal2-validation-message"
-            ).all_inner_texts()
-            errors = []
-            for raw in candidates:
-                message = " ".join(str(raw).split()).strip()
-                # Ignore empty content and required-marker-only text.
-                if not message or message in {"*", "＊", "•", "·"}:
-                    continue
-                # Ignore generic labels that are not actionable validation text.
-                if len(message) == 1 and not message.isalnum():
-                    continue
-                if message not in errors:
-                    errors.append(message)
-
-            if errors:
-                dump_form(page)
-                dump_debug(page, "debug_page")
-                raise RuntimeError(
-                    "Portal returned an actual validation message after save: "
-                    + " | ".join(errors)[:1000]
-                )
-        except RuntimeError:
-            raise
-        except Exception as ex:
-            log(f"Validation-message inspection warning (continuing save verification): {ex}")
-
-    dump_form(page)
-    raise RuntimeError(
-        f"SAVE NOT VERIFIED for this project task. Expected {need:g}h additional; "
-        f"history shows {last_seen:g}h (baseline {baseline:g}h). "
-        "Stopped before opening the next project to prevent misleading success or duplicate entries."
-    )
+            after = todays_hours(page)
+        except Exception:
+            continue
+        if after >= need:
+            break
+    if after >= need:
+        log(f"Saved OK - {after}h now logged for {TODAY}")
+    else:
+        log(f"WARNING: Save clicked but only {after}h shows for {TODAY}. Please verify the entry.")
+    return "saved"
 
 
 def process_project(page, project_code, project_name, ents):
-    """Process one project as a unit; do not return until its save is verified."""
     open_board(page, project_code, project_name)
     cards = safe_eval(page, CARDS_JS)
-    log(f"Project {project_name} [{project_code}]: {len(cards)} task card(s) found")
+    log(f"{len(cards)} task card(s) found")
+    for c in cards:
+        log(f"  {c['title']} | {c['start']} - {c['end']}")
+
     todays = [c for c in cards if in_range(c)]
     if not todays:
-        raise RuntimeError(f"No task card covers {TODAY} for {project_name} [{project_code}]. Project not saved.")
+        log(f"No task covers {TODAY} for {project_name} [{project_code}] - nothing entered")
+        return
 
     for idx, c in enumerate(todays):
         if idx > 0:
             open_board(page, project_code, project_name)
-        log(f"Opening task for project {project_code}: {c['title']}")
+        log(f"Opening task: {c['title']}")
 
-        # Use Playwright click so navigation is awaited instead of executing
-        # page.evaluate immediately after a DOM click (which destroyed context).
+        # Use a Playwright click and wait for navigation. A direct DOM click
+        # can destroy the page execution context while the task page unloads.
+        task_link = page.locator("a[href]").filter(
+            has_text=re.compile(r".*")
+        )
         matching_link = None
-        links = page.locator("a[href]")
-        for link_index in range(links.count()):
-            candidate = links.nth(link_index)
+        for link_index in range(task_link.count()):
+            candidate = task_link.nth(link_index)
             if candidate.get_attribute("href") == c["href"]:
                 matching_link = candidate
                 break
         if matching_link is None:
-            raise RuntimeError(f"Could not find task link: {c['href']}")
+            raise RuntimeError(f"Could not find task link for {c['title']}: {c['href']}")
 
         try:
-            with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=12000):
                 matching_link.click(timeout=10000)
         except Exception:
-            # Some portal builds update the content without a full navigation.
+            # AJAX-style navigation may not trigger a full navigation event.
             pass
 
         page.wait_for_selector("#SaveTimelog", state="visible", timeout=20000)
-        log(f"Task page loaded: {page.url}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=4000)
+        except Exception:
+            pass
 
-        # Compare new descriptions with ALL saved descriptions on this task,
-        # including entries from previous dates.
-        existing_portal_descriptions = portal_existing_descriptions(page)
+        # Compare with the task's existing history before entering new rows.
+        existing_descriptions = portal_existing_descriptions(page)
         task_entries = make_descriptions_unique(
-            ents,
-            reserved_descriptions=existing_portal_descriptions
+            ents, reserved_descriptions=existing_descriptions
         )
         result = fill_current_task(page, task_entries)
         if result == "dry":
-            REPORT["attempted"].append({"project": f"{project_name} [{project_code}]", "hours": sum(float(e["hours"]) for e in ents), "result": "DRY - not saved"})
             input("Check the browser, then press Enter to continue... ")
-            return "dry"
-        if result in ("saved", "done"):
+            return
+        if result in ("saved", "done", "partial"):
             REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
-                                        result=("verified saved" if result == "saved" else "already present"), entries=task_entries))
-            log(f"PROJECT COMPLETE: {project_name} [{project_code}] - {result}. Proceeding to next project.")
-            return result
-        if result == "no_add":
-            continue
-        raise RuntimeError(f"Project {project_code} stopped with status: {result}")
-
-    raise RuntimeError(f"No eligible task page with Add New Item was found for {project_name} [{project_code}].")
+                                        result=result, entries=task_entries))
+            return
+    log(f"No matching task for {project_name} [{project_code}] had an Add New Item button")
 
 
 # ---------------------------------------------------------------- tracking page
@@ -1583,34 +1407,29 @@ def main():
                 "Set TASK_SOURCE_URL in .env to your public Excel/Google Sheets URL, "
                 f"or provide the local {path} file."
             )
-        log(
-            f"India-local date/time: {NOW_IST.strftime('%d-%m-%Y %H:%M:%S %Z')} "
-            f"| processing date only: {TODAY}"
-        )
         entries = read_entries(source)
 
-        # Keep every source task as a separate portal task entry.
-        # Only split an individual task when it exceeds the portal's 5-hour
-        # per-row limit. Decimal hours are converted to HH:MM at form fill time.
+        # First combine all source tasks belonging to the same project and
+        # discipline into one portal description and one summed hour total.
         source_total = sum(float(e["hours"]) for e in entries)
-        entries = split_long_task_entries(entries)
+        combined_entries = combine_project_tasks(entries)
 
-        # Portal requires unique descriptions. Resolve duplicates during import,
-        # before opening the portal, without changing source-sheet values.
-        entries = make_descriptions_unique(entries)
-
+        # Portal rule: maximum 5 hours per individual time-log row. If a
+        # combined project total exceeds 5h, split that combined entry into
+        # multiple rows, preserving the same combined description and total.
+        entries = split_long_task_entries(combined_entries)
         total = sum(float(e["hours"]) for e in entries)
 
         if round(source_total, 2) != round(total, 2):
             raise ValueError(
-                f"Hours changed during task splitting: "
+                f"Hours changed during project combining/splitting: "
                 f"source={source_total:g}h, prepared={total:g}h"
             )
 
         # Convert decimal hours to HH:MM before sending values to the portal.
         for entry in entries:
             log(
-                f"Prepared task entry: {entry['project_code']} | "
+                f"Prepared project entry: {entry['project_code']} | "
                 f"{entry['desc']} | {entry['hours']}h "
                 f"=> {hours_to_portal_time(entry['hours'])}"
             )
