@@ -1,17 +1,7 @@
-
 name: Daily Timesheet Automation
 
 on:
   workflow_dispatch:
-    inputs:
-      run_mode:
-        description: 'Choose automation mode'
-        required: true
-        type: choice
-        default: test
-        options:
-          - test
-          - live
 
 permissions:
   contents: read
@@ -20,19 +10,6 @@ jobs:
   timesheet:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-
-    env:
-      TS_USER: ${{ secrets.TS_USER }}
-      TS_PASS: ${{ secrets.TS_PASS }}
-      TS_DISPLAY_NAME: ${{ secrets.TS_DISPLAY_NAME }}
-      TASK_SOURCE_URL: ${{ secrets.TASK_SOURCE_URL }}
-
-      MAIL_USER: ${{ secrets.MAIL_USER }}
-      MAIL_PASS: ${{ secrets.MAIL_PASS }}
-      MAIL_TO: ${{ secrets.MAIL_TO }}
-
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout repository
@@ -56,15 +33,15 @@ jobs:
           python -c "import playwright; print('Playwright installed successfully')"
           python -m playwright --version
 
-      # TEST MODE: Sends test email and Telegram notification only.
-      # Does NOT execute timesheet automation.
-      - name: Test Email and Telegram Notifications
-        if: ${{ inputs.run_mode == 'test' }}
-        run: python timesheet.py mailtest
-
-      # LIVE MODE: Runs the actual timesheet automation.
       - name: Run Timesheet Automation
-        if: ${{ inputs.run_mode == 'live' }}
+        env:
+          TS_USER: ${{ secrets.TS_USER }}
+          TS_PASS: ${{ secrets.TS_PASS }}
+          TS_DISPLAY_NAME: ${{ secrets.TS_DISPLAY_NAME }}
+          TASK_SOURCE_URL: ${{ secrets.TASK_SOURCE_URL }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python timesheet.py hide
 
       - name: Upload Timesheet Debug Files
