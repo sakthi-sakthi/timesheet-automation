@@ -1,4 +1,4 @@
-import os, re, sys, time, smtplib, datetime, logging
+import os, re, sys, time, smtplib, datetime, logging, json
 from collections import OrderedDict
 from pathlib import Path
 from email.message import EmailMessage
@@ -20,6 +20,8 @@ LOGGED_IN_NAME = TS_DISPLAY_NAME or USER
 MAIL_USER = os.environ.get("MAIL_USER", "")
 MAIL_PASS = os.environ.get("MAIL_PASS", "")
 MAIL_TO = os.environ.get("MAIL_TO", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 BASE = "https://bsoftagile.boscosofttech.com/"
 # Keep the original runner/system date behavior used by the previously working
@@ -729,6 +731,51 @@ def send_email(subject, body, attachments):
         return False
 
 
+def send_telegram(message):
+    """
+    Send a Telegram notification using the official Bot API.
+    Credentials are read only from environment variables / GitHub Actions Secrets.
+    Long reports are split into Telegram-safe message chunks.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram NOT sent: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing")
+        return False
+
+    try:
+        # Telegram sendMessage limit is 4096 characters. Keep a safety margin.
+        chunks = []
+        remaining = str(message)
+        while remaining:
+            if len(remaining) <= 3900:
+                chunks.append(remaining)
+                break
+            split_at = remaining.rfind("\\n", 0, 3900)
+            if split_at < 1000:
+                split_at = 3900
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip()
+
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        for chunk in chunks:
+            payload = urllib.parse.urlencode({
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview": "true",
+            }).encode("utf-8")
+            request = urllib.request.Request(api_url, data=payload, method="POST")
+            with urllib.request.urlopen(request, timeout=20) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if not result.get("ok"):
+                raise RuntimeError(result.get("description", "Telegram API returned ok=false"))
+
+        log(f"Telegram notification sent ({len(chunks)} message(s))")
+        return True
+    except Exception as ex:
+        # Notification failure must never hide or replace the timesheet result.
+        log(f"Telegram FAILED: {ex}")
+        return False
+
+
 def build_report_email(expected, label):
     t = REPORT["tracking"] or {"status": "NOT CHECKED", "row": ""}
     ok = t["status"] == "OK" and not REPORT["error"]
@@ -1388,6 +1435,7 @@ def main():
             raise Exception("Set MAIL_USER, MAIL_PASS and MAIL_TO in .env before testing email")
         send_email("Timesheet bot test email",
                    "If you can read this, email sending works.", [])
+        send_telegram("Timesheet automation test\\nTelegram notification connection is working.")
         return
 
     if MODE not in ("track",) and (not USER or not PASS):
@@ -1495,6 +1543,7 @@ def main():
             log(f"Tracking page: {t['status']} | {t['row']} {t['note']}")
             subject, body = build_report_email(expected, label)
             send_email(subject, body, REPORT["shots"])
+            send_telegram("✅ TIMESHEET COMPLETED\\n\\n" + body)
 
             log(f"FINISHED in {time.time() - T0:.1f} seconds")
             if MODE != "hide":
@@ -1508,6 +1557,7 @@ def main():
             if MODE != "track":
                 subject, body = build_report_email(expected, label)
                 send_email("[ATTENTION] Timesheet FAILED " + TODAY, body, REPORT["shots"])
+                send_telegram("❌ TIMESHEET FAILED\\n\\n" + body)
             raise
         finally:
             # The sync_playwright context manager stops Playwright automatically.
