@@ -84,15 +84,15 @@ def normalize_task_row(row):
                 return str(value).strip()
         return default
 
-    project_code = get("project code", "project id", "code", "project")
-    project_name = get("project name", "project title", default=project_code)
+    client_code = get("client code", "client id")
+    project_name = get("project name", "project title")
     discipline = get("discipline", "category")
     desc = get("activity description", "description", "task description", "activity")
     hours = get("actual hours", "hours", "hrs", "time")
     status = get("status", default="Completed")
     date_value = get("date", "work date")
 
-    if not any((date_value, project_code, discipline, desc, hours)):
+    if not any((date_value, client_code, project_name, discipline, desc, hours)):
         return None
     if not date_value:
         raise ValueError("Date is required for every task row. Use DD-MM-YYYY.")
@@ -112,9 +112,10 @@ def normalize_task_row(row):
     if row_date != TODAY_D:
         return None
 
-    if not all((project_code, discipline, desc, hours)):
+    if not all((client_code, project_name, discipline, desc, hours)):
         raise ValueError(
-            "Today's task row needs Project Code, Discipline, Activity Description and Actual Hours."
+            "Today's task row needs Client Code, Project Name, Discipline, "
+            "Activity Description and Actual Hours."
         )
     try:
         number = float(hours)
@@ -124,9 +125,9 @@ def normalize_task_row(row):
         raise ValueError(f"Hours must be greater than 0 and at most 24: {hours}")
 
     return {
-        "project": project_code,          # stable unique key
-        "project_code": project_code,
-        "project_name": project_name,     # display/dropdown name
+        "project": client_code,           # stable client reference
+        "client_code": client_code,
+        "project_name": project_name,     # portal project-card title
         "discipline": discipline,
         "desc": desc,
         "hours": f"{number:g}",
@@ -810,53 +811,69 @@ def board_link_ready(page):
 
 
 
-def open_board(page, project_code, project_name=""):
+def open_board(page, client_code, project_name=""):
+    """
+    Open the project board using the project title visible to the employee.
+
+    Client Code is maintained in the task sheet as the stable grouping/reference
+    key. It is not searched in the portal because the employee login does not
+    display Client Code on the Project Details cards.
+    """
+    if not project_name:
+        raise ValueError(f"Project Name is required for Client Code {client_code}")
+
     page.goto(BASE + "project-details", wait_until="domcontentloaded")
     page.wait_for_timeout(1500)
 
-    log(f"Selecting project by permanent code: {project_code}")
+    log(
+        f"Selecting project by visible title: {project_name} "
+        f"(Client Code: {client_code})"
+    )
 
     try:
-        # Find the visible project code text
-        code = page.get_by_text(
-            re.compile(rf"^{re.escape(project_code)}\s*-", re.I)
-        ).first
+        title = page.get_by_text(project_name, exact=True)
+        title_count = title.count()
+        if title_count != 1:
+            raise RuntimeError(
+                f"Expected exactly one project title '{project_name}', "
+                f"but found {title_count}."
+            )
 
-        code.wait_for(state="visible", timeout=15000)
+        title.first.wait_for(state="visible", timeout=15000)
 
-        # Find the project card containing the code
-        card = code
-        for _ in range(8):
-            if card.locator("a").count() > 0:
+        # Search upward from the exact project title for the board link
+        # belonging to that same project card.
+        card = title.first
+        board_link = None
+        for _ in range(10):
+            candidate = card.locator("a[href*='board']").first
+            if candidate.count() and candidate.is_visible():
+                board_link = candidate
                 break
             card = card.locator("xpath=..")
 
-        # Find the board link inside this project card
-        board_link = card.locator("a[href*='board']").first
-
-        if board_link.count() == 0:
-            # If the code is inside the card but the link is outside,
-            # click the project title within the nearest card.
-            title = page.get_by_text(
-                project_name, exact=False
-            ).first
-            title.click(timeout=10000)
-        else:
+        if board_link is not None:
             board_link.click(timeout=10000)
+        else:
+            # Some portal layouts make the project title itself clickable.
+            title.first.click(timeout=10000)
 
         page.wait_for_timeout(1500)
 
         if page.locator("a[href*='go-to-tabs']").count() == 0:
             dump_debug(page)
-            raise Exception("Board link clicked, but task board did not load.")
+            raise RuntimeError(
+                "Project was selected, but its task board did not load."
+            )
 
-        log(f"Board ready: {project_name} [{project_code}]")
+        log(f"Board ready: {project_name} [Client Code: {client_code}]")
 
     except Exception as ex:
         dump_debug(page)
-        raise Exception(
-            f"Could not open project {project_code}: {ex}"
-        )
+        raise RuntimeError(
+            f"Could not open project '{project_name}' "
+            f"(Client Code {client_code}): {ex}"
+        ) from ex
 
 def in_range(card):
     if not card["start"] or not card["end"]:
@@ -1233,8 +1250,8 @@ def fill_current_task(page, entries):
     return "saved"
 
 
-def process_project(page, project_code, project_name, ents):
-    open_board(page, project_code, project_name)
+def process_project(page, client_code, project_name, ents):
+    open_board(page, client_code, project_name)
     cards = safe_eval(page, CARDS_JS)
     log(f"{len(cards)} task card(s) found")
     for c in cards:
@@ -1242,12 +1259,12 @@ def process_project(page, project_code, project_name, ents):
 
     todays = [c for c in cards if in_range(c)]
     if not todays:
-        log(f"No task covers {TODAY} for {project_name} [{project_code}] - nothing entered")
+        log(f"No task covers {TODAY} for {project_name} [Client Code: {client_code}] - nothing entered")
         return
 
     for idx, c in enumerate(todays):
         if idx > 0:
-            open_board(page, project_code, project_name)
+            open_board(page, client_code, project_name)
         log(f"Opening task: {c['title']}")
         # Use locator click and wait for navigation to finish before inspecting DOM.
         task_link = None
@@ -1274,10 +1291,10 @@ def process_project(page, project_code, project_name, ents):
         task_entries = make_descriptions_unique(ents, existing_descriptions)
         result = fill_current_task(page, task_entries)
         if result in ("saved", "done", "partial"):
-            REPORT["tasks"].append(dict(project=f"{project_name} [{project_code}]", title=c["title"],
+            REPORT["tasks"].append(dict(project=f"{project_name} [Client Code: {client_code}]", title=c["title"],
                                         result=result, entries=task_entries))
             return
-    log(f"No matching task for {project_name} [{project_code}] had an Add New Item button")
+    log(f"No matching task for {project_name} [Client Code: {client_code}] had an Add New Item button")
 
 
 # ---------------------------------------------------------------- tracking page
@@ -1429,7 +1446,7 @@ def main():
         # Convert decimal hours to HH:MM before sending values to the portal.
         for entry in entries:
             log(
-                f"Prepared project entry: {entry['project_code']} | "
+                f"Prepared project entry: {entry['client_code']} | "
                 f"{entry['desc']} | {entry['hours']}h "
                 f"=> {hours_to_portal_time(entry['hours'])}"
             )
@@ -1441,7 +1458,7 @@ def main():
             log(f"Hours validation passed: {total:g}h (minimum {expected}h; no upper cap)")
         groups = OrderedDict()
         for e in entries:
-            groups.setdefault(e["project_code"], {"name": e["project_name"], "entries": []})["entries"].append(e)
+            groups.setdefault(e["client_code"], {"name": e["project_name"], "entries": []})["entries"].append(e)
     else:
         path, expected, label = "", WEEKDAY_HOURS, "track"
         groups = {}
@@ -1487,8 +1504,8 @@ def main():
                 track_only(page)
                 return
 
-            for project_code, project_data in groups.items():
-                process_project(page, project_code, project_data["name"], project_data["entries"])
+            for client_code, project_data in groups.items():
+                process_project(page, client_code, project_data["name"], project_data["entries"])
 
             REPORT["tracking"] = check_tracking(page, expected)
             t = REPORT["tracking"]
