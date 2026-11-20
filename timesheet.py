@@ -813,11 +813,12 @@ def board_link_ready(page):
 
 def open_board(page, client_code, project_name=""):
     """
-    Open the project board using the project title visible to the employee.
+    Open the project board by locating the exact project-title anchor.
 
-    Client Code is maintained in the task sheet as the stable grouping/reference
-    key. It is not searched in the portal because the employee login does not
-    display Client Code on the Project Details cards.
+    Playwright get_by_text() can match both the title element and its parent
+    container. To avoid false duplicate matches, inspect actual anchors and
+    require exactly one anchor whose normalized visible text equals the
+    Project Name supplied by the sheet.
     """
     if not project_name:
         raise ValueError(f"Project Name is required for Client Code {client_code}")
@@ -826,48 +827,106 @@ def open_board(page, client_code, project_name=""):
     page.wait_for_timeout(1500)
 
     log(
-        f"Selecting project by visible title: {project_name} "
+        f"Selecting project by exact title link: {project_name} "
         f"(Client Code: {client_code})"
     )
 
     try:
-        # The sheet contains the current full project title for this sprint.
-        # Match that exact title. A broad stable-phrase selector can match both
-        # the title element and its containing card, so it is intentionally avoided.
-        title = page.get_by_text(project_name, exact=True)
-        title_count = title.count()
-        if title_count != 1:
+        # Normalize whitespace because the title may wrap onto multiple lines.
+        matching_links = page.locator("a").evaluate_all(
+            """(anchors, expected) => {
+                const norm = value => (value || "").replace(/\\s+/g, " ").trim();
+                const wanted = norm(expected);
+                return anchors
+                    .filter(a => {
+                        const r = a.getBoundingClientRect();
+                        const visible = r.width > 0 && r.height > 0 &&
+                            getComputedStyle(a).visibility !== "hidden" &&
+                            getComputedStyle(a).display !== "none";
+                        return visible && norm(a.innerText) === wanted;
+                    })
+                    .map(a => ({
+                        text: norm(a.innerText),
+                        href: a.getAttribute("href"),
+                        html: a.outerHTML.slice(0, 1200)
+                    }));
+            }""",
+            project_name
+        )
+
+        if len(matching_links) != 1:
+            # Save useful evidence showing which anchors contain the project
+            # title, without clicking an ambiguous element.
+            diagnostics = page.locator("a").evaluate_all(
+                """(anchors, expected) => {
+                    const norm = value => (value || "").replace(/\\s+/g, " ").trim();
+                    const wanted = norm(expected).toLowerCase();
+                    return anchors
+                        .filter(a => norm(a.innerText).toLowerCase().includes(wanted))
+                        .map(a => ({
+                            text: norm(a.innerText),
+                            href: a.getAttribute("href"),
+                            html: a.outerHTML.slice(0, 1200)
+                        }));
+                }""",
+                project_name
+            )
+            with open("project_selector_debug.txt", "w", encoding="utf-8") as f:
+                f.write(
+                    f"Expected project title: {project_name}\n"
+                    f"Exact visible anchor matches: {len(matching_links)}\n\n"
+                    f"Exact matches:\n{matching_links}\n\n"
+                    f"Containing anchor candidates:\n{diagnostics}\n"
+                )
+            dump_debug(page)
             raise RuntimeError(
-                f"Expected exactly one exact project title '{project_name}', "
-                f"but found {title_count}. "
-                "Stopped to avoid selecting the wrong project."
+                f"Expected exactly one visible clickable link with title "
+                f"'{project_name}', but found {len(matching_links)}. "
+                "No project was clicked. See project_selector_debug.txt."
             )
 
-        title.first.wait_for(state="visible", timeout=15000)
+        target = page.locator("a").evaluate_all(
+            """(anchors, expected) => {
+                const norm = value => (value || "").replace(/\\s+/g, " ").trim();
+                const wanted = norm(expected);
+                const matches = anchors.filter(a => {
+                    const r = a.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 &&
+                        getComputedStyle(a).visibility !== "hidden" &&
+                        getComputedStyle(a).display !== "none" &&
+                        norm(a.innerText) === wanted;
+                });
+                if (matches.length !== 1) return null;
+                const a = matches[0];
+                return {
+                    index: Array.from(anchors).indexOf(a),
+                    href: a.getAttribute("href"),
+                    text: norm(a.innerText)
+                };
+            }""",
+            project_name
+        )
 
-        # Search upward from the matching project title for the board link
-        # belonging to that same project card.
-        card = title.first
-        board_link = None
-        for _ in range(10):
-            candidate = card.locator("a[href*='board']").first
-            if candidate.count() and candidate.is_visible():
-                board_link = candidate
-                break
-            card = card.locator("xpath=..")
+        if not target or not target.get("href"):
+            dump_debug(page)
+            raise RuntimeError(
+                "The unique project title link has no usable href. "
+                "No project was clicked."
+            )
 
-        if board_link is not None:
-            board_link.click(timeout=10000)
-        else:
-            # Some portal layouts make the project title itself clickable.
-            title.first.click(timeout=10000)
+        log(f"Unique project link found: {target['href']}")
 
+        # Click the exact anchor index found by the DOM inspection above.
+        # This avoids accidentally clicking another anchor sharing the same href.
+        if target.get("index") is None:
+            raise RuntimeError("Could not resolve the unique project link index.")
+        page.locator("a").nth(target["index"]).click(timeout=10000)
         page.wait_for_timeout(1500)
 
         if page.locator("a[href*='go-to-tabs']").count() == 0:
             dump_debug(page)
             raise RuntimeError(
-                "Project was selected, but its task board did not load."
+                "Project link was clicked, but its task board did not load."
             )
 
         log(f"Board ready: {project_name} [Client Code: {client_code}]")
@@ -878,6 +937,7 @@ def open_board(page, client_code, project_name=""):
             f"Could not open project '{project_name}' "
             f"(Client Code {client_code}): {ex}"
         ) from ex
+
 
 def in_range(card):
     if not card["start"] or not card["end"]:
