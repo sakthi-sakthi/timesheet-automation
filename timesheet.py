@@ -831,18 +831,15 @@ def open_board(page, client_code, project_name=""):
     )
 
     try:
-        # The full project title/version may change between sprints.
-        # The stable identifying phrase for this client is "NETS Web Projects".
-        # Match the project card by that phrase, not the changing suffix/version.
-        stable_project_phrase = "NETS Web Projects"
-        title = page.get_by_text(
-            re.compile(rf"^{re.escape(stable_project_phrase)}\b", re.I)
-        )
+        # The sheet contains the current full project title for this sprint.
+        # Match that exact title. A broad stable-phrase selector can match both
+        # the title element and its containing card, so it is intentionally avoided.
+        title = page.get_by_text(project_name, exact=True)
         title_count = title.count()
         if title_count != 1:
             raise RuntimeError(
-                f"Expected exactly one project title beginning with "
-                f"'{stable_project_phrase}', but found {title_count}. "
+                f"Expected exactly one exact project title '{project_name}', "
+                f"but found {title_count}. "
                 "Stopped to avoid selecting the wrong project."
             )
 
