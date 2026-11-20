@@ -836,7 +836,7 @@ def open_board(page, client_code, project_name=""):
         # Match the project card by that phrase, not the changing suffix/version.
         stable_project_phrase = "NETS Web Projects"
         title = page.get_by_text(
-            re.compile(rf"^{re.escape(stable_project_phrase)}\\b", re.I)
+            re.compile(rf"^{re.escape(stable_project_phrase)}\b", re.I)
         )
         title_count = title.count()
         if title_count != 1:
